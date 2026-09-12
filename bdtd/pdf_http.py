@@ -3,8 +3,10 @@ import hashlib
 import json
 import os
 import random
+import ssl
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, IncompleteRead
@@ -36,13 +38,15 @@ def clean_url(url):
 
 class StreamClient(Client):
     def __init__(self, contact, directory, max_bytes=100*1024**2, budget=500*1024**2):
-        super().__init__(f'BDTD-Academic-Crawler/0.3 (contato: {contact})', log=Path(directory)/'logs/pdf_http.jsonl')
+        super().__init__(f'BDTD-Academic-Crawler/0.3.2 (contato: {contact})', log=Path(directory)/'logs/pdf_http.jsonl')
         self.directory = Path(directory)
         self.max_bytes, self.budget, self.transferred = max_bytes, budget, 0
         (self.directory/'tmp').mkdir(parents=True, exist_ok=True)
         self.robots_delays = {}
         self.policy_failures = {}
         self.policy_details = {}
+        self.run_id = uuid.uuid4().hex
+        self.record_id = None
 
     def _check_budget(self, url, stage):
         if self.transferred >= self.budget:
@@ -105,7 +109,8 @@ class StreamClient(Client):
                 exc.details.setdefault('cause', exc.code)
             elif isinstance(exc, (TimeoutError, URLError, ConnectionError, HTTPException)) and not isinstance(exc, HTTPError):
                 reason=exc.reason if isinstance(exc, URLError) else exc
-                cause='timeout' if isinstance(reason, TimeoutError) else 'network'
+                cause=('timeout' if isinstance(reason, TimeoutError) else
+                       'tls_verification' if isinstance(reason, ssl.SSLCertVerificationError) else 'network')
                 code='timeout' if cause=='timeout' else 'erro_rede'
                 if isinstance(exc, IncompleteRead):
                     cause, code='response_incomplete', 'download_incompleto'
@@ -114,7 +119,9 @@ class StreamClient(Client):
         finally:
             self.log.parent.mkdir(parents=True, exist_ok=True)
             with self.log.open('a', encoding='utf-8') as f:
-                entry=dict(ts=now(),url=url,status=status,bytes=size,error=error,stage=stage,attempt=attempt)
+                entry=dict(ts=now(),run_id=self.run_id,url=url,status=status,bytes=size,
+                           error=error,stage=stage,attempt=attempt)
+                if self.record_id: entry['record_id']=self.record_id
                 if response_sha: entry['sha256']=response_sha
                 p=urlsplit(url)
                 if stage=='resource': entry.update(self.policy_details.get(p.scheme+'://'+p.netloc, {}))
@@ -217,6 +224,14 @@ class StreamClient(Client):
             rate=parser.request_rate(self.agent)
             if rate and rate.requests: delay=max(delay,rate.seconds/rate.requests)
             self.robots_delays[p.netloc]=max(1,delay)
+            policy_url=urlsplit(evidence.get('robots_url',''))
+            policy_origin=policy_url.scheme+'://'+policy_url.netloc
+            if policy_url.path=='/robots.txt' and policy_origin!=origin:
+                # Um redirect confirmado para o robots canônico também confirma
+                # a política da origem de destino durante esta execução.
+                self.rules.setdefault(policy_origin,parser)
+                self.policy_details.setdefault(policy_origin,evidence)
+                self.robots_delays.setdefault(policy_url.netloc,max(1,delay))
         if not self.rules[origin].can_fetch(self.agent,url):
             raise failure('robots_bloqueado','robots.txt não permite esta URL.',
                           self.policy_details[origin]['robots_url'],'robots','disallow',
