@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import ssl
 import tempfile
 import unittest
 from email.message import Message
@@ -62,6 +63,7 @@ class StreamHTTPTests(unittest.TestCase):
     def test_robots_timeout_and_network_failures_keep_their_cause(self):
         for error, cause in ((TimeoutError('fixture timeout'),'timeout'),
                              (URLError(TimeoutError('fixture timeout')),'timeout'),
+                             (URLError(ssl.SSLCertVerificationError('fixture certificate')),'tls_verification'),
                              (URLError('fixture DNS error'),'network')):
             with self.subTest(cause=cause,error=str(error)):
                 self.client=StreamClient('test@example.org',self.tmp.name)
@@ -108,6 +110,17 @@ class StreamHTTPTests(unittest.TestCase):
         self.assertTrue(robots.closed)
         self.assertTrue(redirect.fp.closed)
         self.assertTrue(denied.fp.closed)
+
+    def test_robots_redirect_policy_is_reused_at_https_destination(self):
+        robots_redirect=http_error('http://example.org/robots.txt',301,Location='https://example.org/robots.txt')
+        resource_redirect=http_error('http://example.org/item',301,Location='https://example.org/item')
+        with patch.object(self.client.opener,'open',side_effect=[robots_redirect,
+                Response(b'User-agent: *\nDisallow:\n'),resource_redirect,Response(b'fixture')]) as opened:
+            result=self.client.fetch('http://example.org/item')
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list],[
+            'http://example.org/robots.txt','https://example.org/robots.txt',
+            'http://example.org/item','https://example.org/item'])
+        self.assertTrue(result['robots_policy']['policy_cached'])
 
     def test_robots_redirect_failure_caches_for_original_origin(self):
         redirect=http_error('https://example.org/robots.txt',301,Location='https://policy.example/robots.txt')
@@ -164,6 +177,7 @@ class StreamHTTPTests(unittest.TestCase):
 
     def test_policy_artifact_and_request_are_correlated_in_log_and_result(self):
         body=b'User-agent: *\nDisallow:\n'
+        self.client.record_id='record-1'
         with patch.object(self.client.opener,'open',side_effect=[Response(body),Response(b'fixture'),Response(b'next')]) as opened:
             result=self.client.fetch('https://example.org/item')
             cached=self.client.fetch('https://example.org/another')
@@ -177,6 +191,8 @@ class StreamHTTPTests(unittest.TestCase):
         self.assertEqual(logs[0]['sha256'],evidence['robots_sha256'])
         self.assertEqual(logs[1]['robots_path'],evidence['robots_path'])
         self.assertEqual(logs[1]['robots_url'],logs[0]['url'])
+        self.assertTrue(all(item['run_id']==self.client.run_id for item in logs))
+        self.assertTrue(all(item['record_id']=='record-1' for item in logs))
 
     def test_html_policy_is_archived_but_does_not_authorize_resource(self):
         body=b'<!doctype html><html>Access denied</html>'

@@ -1,4 +1,4 @@
-# BDTD — v0.3.0: piloto de download de PDFs
+# BDTD — v0.3.2: piloto de download de PDFs
 
 ## Execute no Windows
 
@@ -16,7 +16,7 @@ O comando tenta **até oito registros por execução**, na ordem do arquivo de e
 
 Ao terminar, envie **`data/pdf-piloto/reports/pdf_pilot.json`**.
 
-Para continuar os próximos oito registros, repita o mesmo comando. Registros com resultados anteriores são pulados, salvo sucesso cujo arquivo esteja ausente/corrompido. Para incluir falhas anteriores na nova tentativa:
+Para continuar os próximos oito registros, repita o mesmo comando. Registros com resultados anteriores são pulados, salvo sucesso cujo arquivo esteja ausente/corrompido. Para incluir falhas e sucessos parciais anteriores na nova tentativa:
 
 ```powershell
 python -m bdtd.pdfs --contact "seu-email@dominio.com" --retry-failed
@@ -28,7 +28,7 @@ Para tentar até 40 registros numa execução:
 python -m bdtd.pdfs --contact "seu-email@dominio.com" --limit 40
 ```
 
-`--limit` limita os registros tentados **nesta execução**, diferente de `--pages` do piloto API. Limite máximo por execução: 50 registros. O orçamento de transferência pode interromper antes de terminar todos. Use `--retry-failed` para retomar tentativas afetadas por esse limite. Cada resposta interrompida é reiniciada; não há HTTP Range para continuar de um byte parcial.
+`--limit` limita os registros tentados **nesta execução**, diferente de `--pages` do piloto API. Limite máximo por execução: 50 registros. O orçamento de transferência pode interromper antes de terminar todos. Use `--retry-failed` para retomar tentativas afetadas por esse limite. PDFs íntegros já obtidos são mantidos, e candidatos pendentes têm prioridade. Cada resposta interrompida é reiniciada; não há HTTP Range para continuar de um byte parcial.
 
 Para seu próprio arquivo de metadados:
 
@@ -48,6 +48,11 @@ Não reutilize o diretório de saída com entrada diferente. O hash do snapshot 
 - Tentativas limitadas em 429/5xx, backoff e Retry-After. Esperas acima de 60 segundos são reportadas para retomada posterior.
 - Identificação por SHA-256; conteúdo idêntico ocupa um único objeto Raw e pode estar associado a vários registros.
 - Cache de respostas e retomada em SQLite. Em `--retry-failed`, páginas HTML são consultadas novamente; PDFs válidos em cache podem ser reutilizados.
+- Falhas ao consultar `robots.txt` são reutilizadas apenas durante a execução atual, evitando requisições repetidas ao mesmo domínio. Uma nova execução verifica a política outra vez.
+- Logs e tentativas novos distinguem a fase de política da fase do documento e registram a URL/status da política consultada.
+- Objetos cujo checksum divergiu são preservados em `raw/corrupt/` antes da recuperação da cópia válida.
+- Variantes conhecidas do mesmo bitstream DSpace são deduplicadas antes do download; respostas idênticas ainda recebidas são contabilizadas separadamente.
+- Cada execução e registro recebem identificadores correlacionáveis nos novos logs HTTP.
 - Metatags bibliográficas reconhecidas são preservadas em `staging/metadata_html.jsonl`, sem inventar campos ausentes.
 
 São seguidos apenas links recebidos em metadados, HTML e redirecionamentos. Não se adivinham IDs ou endpoints de bitstreams. Páginas que dependem de JavaScript/API DSpace 7 específica ainda podem ficar sem resolução; o motivo é registrado. Não há navegador automatizado, resolução de desafios, login, quebra de embargo ou desativação de TLS.
@@ -62,6 +67,7 @@ data/pdf-piloto/
   raw/robots/                 políticas consultadas com sucesso
   raw/other/                  respostas de outros formatos, quando houver
   raw/invalid_pdf/            respostas PDF suspeitas/incompletas, quando houver
+  raw/corrupt/                objetos divergentes preservados durante recuperação
   raw/manifest_pdf.jsonl       resultado detalhado por registro
   staging/metadata_html.jsonl metatags bibliográficas encontradas
   reports/pdf_pilot.json      resumo para enviar na conversa
@@ -86,6 +92,7 @@ Não apague SQLite: a reconstrução automática integral do estado a partir de 
 | `robots_indisponivel` | Não foi possível confirmar a política, por exemplo por erro ou HTML de verificação. |
 | `sem_link_pdf_no_html` | Parser não encontrou link PDF no HTML recebido; não prova inexistência do PDF. |
 | `pdf_invalido_ou_incompleto` | A resposta não passou na assinatura/EOF. |
+| `pdf_duplicado` | Uma segunda URL entregou bytes já associados ao registro; o Raw continua deduplicado por SHA-256. |
 | `verificacao_navegador` | Foi identificado desafio de navegador. |
 | `limite_arquivo`, `limite_execucao` | Limite configurado atingido. |
 | `limited: true` | A fila de candidatos não foi esgotada ou um limite foi atingido. |
@@ -100,7 +107,8 @@ Assinatura `%PDF-` e marcador `%%EOF`, junto à conferência de Content-Length q
 ## Evidência usada para construir esta versão
 
 - Entrada recebida: 40 registros, 39 com pelo menos um link, 4 URLs terminando em PDF e 13 URLs em `hdl.handle.net`.
-- Inspeção pública confirmou links de arquivos nas páginas da PUC-SP e da UFSC abaixo. Não foi executado download real pelo novo cliente nesta entrega.
+- Duas rodadas reais processaram 16 registros. A segunda obteve quatro PDFs distintos da UFMG e UFSC, com 21.300.021 bytes no Raw. Todos conferiram com o SHA-256 do manifesto, assinatura `%PDF-` e marcador `%%EOF`.
+- As páginas publicaram duas URLs para cada PDF e a versão 0.3.1 transferiu cada conteúdo duas vezes. A versão 0.3.2 deduplica essas variantes conhecidas antes da transferência e explicita duplicatas remanescentes no relatório.
 - PUC-SP: https://tede2.pucsp.br/handle/handle/5217 — arquivo anunciado de aproximadamente 37,68 MB, justificando streaming e limite acima dos 20 MB do antigo cliente de metadados.
 - UFSC: https://repositorio.ufsc.br/handle/123456789/192778
 
@@ -112,7 +120,7 @@ A capacidade de acesso do crawler depende do ambiente e das políticas atuais de
 python -m unittest discover -s tests -v
 ```
 
-27 testes passaram em Linux/Python 3.12. Cobrem retomada, cache, múltiplos arquivos, respostas HTML disfarçadas de PDF, arquivos truncados, redirecionamentos com robots no destino, limite de streaming e preservação de estado. Downloads de teste usam respostas simuladas; nenhum teste comprova sucesso real nos repositórios.
+57 testes passaram em Windows/Python 3.14. Cobrem retomada, cache, múltiplos arquivos, respostas HTML disfarçadas de PDF, arquivos truncados, redirecionamentos com robots no destino, limites de streaming, diagnóstico de política, deduplicação de candidatos e preservação de estado. Os testes automatizados usam respostas simuladas; a evidência real é a rodada descrita acima.
 
 Os módulos anteriores continuam disponíveis:
 
@@ -121,6 +129,6 @@ python -m bdtd demo
 python -m bdtd.api --contact "seu-email@dominio.com" --data-dir data/api-linguagem
 ```
 
-Nesta versão, a configuração padrão da API foi atualizada para **Linguagem OR Comunicação**, com 30.476 como referência da captura. Os módulos têm versões de processamento próprias: OAI 0.1.0, API 0.2.0, PDF 0.3.0. Documentos em `docs/README_v0.1.md` e `docs/README_v0.2.md` são históricos; este README descreve o estado atual.
+Nesta versão, a configuração padrão da API foi atualizada para **Linguagem OR Comunicação**, com 30.476 como referência da captura. Os módulos têm versões de processamento próprias: OAI 0.1.0, API 0.2.0, PDF 0.3.2. Documentos em `docs/README_v0.1.md` e `docs/README_v0.2.md` são históricos; este README descreve o estado atual.
 
 Continuam pendentes: delimitação definitiva da área, metadados de detalhe da BDTD, adaptadores adicionais, Parquet, extração e validação textual, Processed, anonimização e produtos Curated. Não há treino de modelos nem publicação do corpus.

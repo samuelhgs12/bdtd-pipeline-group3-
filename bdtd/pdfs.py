@@ -4,6 +4,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from html.parser import HTMLParser
 from pathlib import Path
@@ -11,16 +12,31 @@ from urllib.parse import urljoin, urlsplit
 from .core import atomic, digest, now
 from .pdf_http import FetchError, StreamClient, clean_url
 
-VERSION='0.3.1'
+VERSION='0.3.2'
 LIMIT_STATUSES={'limite_arquivo','limite_execucao','limite_profundidade',
                 'redirect_limite','html_grande'}
-COMPLETED_ATTEMPTS={'pdf_obtido','links_localizados'}
+COMPLETED_ATTEMPTS={'pdf_obtido','pdf_duplicado','links_localizados'}
+
+
+def candidate_identity(url):
+    """Agrupa variantes conhecidas do mesmo bitstream sem alterar a URL requisitada."""
+    p=urlsplit(url)
+    path=re.sub(r'/+','/',p.path)
+    path=re.sub(r';jsessionid=[^/;]+','',path,flags=re.IGNORECASE)
+    dspace_path=path[6:] if path.lower().startswith('/xmlui/') else path
+    handle=re.match(r'^/bitstream/handle/([^/]+/[^/]+)/([^/]+)$',dspace_path,re.IGNORECASE)
+    legacy=re.match(r'^/bitstream/([^/]+/[^/]+)/\d+/([^/]+)$',dspace_path,re.IGNORECASE)
+    match=handle or legacy
+    if match:
+        return ('dspace',p.scheme.lower(),p.netloc.lower(),match.group(1),match.group(2).casefold())
+    return ('url',p.scheme.lower(),p.netloc.lower(),path,p.query)
 
 class Links(HTMLParser):
     def __init__(self, base):
         super().__init__(convert_charrefs=True)
         self.base=base
         self.candidates=[]
+        self.identity_indexes={}
         self.metadata=collections.defaultdict(list)
     def handle_starttag(self, tag, attrs):
         a=dict(attrs)
@@ -41,7 +57,15 @@ class Links(HTMLParser):
     def add(self, value):
         try: url=clean_url(urljoin(self.base,value))
         except (ValueError,FetchError): return
-        if url not in self.candidates: self.candidates.append(url)
+        identity=candidate_identity(url)
+        if identity in self.identity_indexes:
+            index=self.identity_indexes[identity]
+            # Prefere a forma sem barras duplicadas quando a página publica ambas.
+            if '//' in urlsplit(self.candidates[index]).path and '//' not in urlsplit(url).path:
+                self.candidates[index]=url
+            return
+        self.identity_indexes[identity]=len(self.candidates)
+        self.candidates.append(url)
 
 
 def pdf_signature(path):
@@ -92,11 +116,21 @@ class Downloader:
         relative=Path('raw')/kind/result['sha256'][:2]/(result['sha256']+extension)
         dest=self.directory/relative
         dest.parent.mkdir(parents=True,exist_ok=True)
+        recovered_corrupt_path=None
         if dest.exists() and file_hash(dest)!=result['sha256']:
-            path.unlink(missing_ok=True)
-            raise ValueError('Objeto Raw existente corrompido.')
+            corrupt_sha=file_hash(dest)
+            corrupt_dir=self.directory/'raw/corrupt'/corrupt_sha[:2]
+            corrupt_dir.mkdir(parents=True,exist_ok=True)
+            corrupt_dest=corrupt_dir/(corrupt_sha+dest.suffix)
+            counter=1
+            while corrupt_dest.exists():
+                corrupt_dest=corrupt_dir/(f'{corrupt_sha}.{counter}{dest.suffix}')
+                counter+=1
+            os.replace(dest,corrupt_dest)
+            recovered_corrupt_path=corrupt_dest.relative_to(self.directory).as_posix()
         os.replace(path,dest)
         value=dict(result,path=relative.as_posix(),kind=kind,cached=False,harvest_ts=now())
+        if recovered_corrupt_path: value['recovered_corrupt_path']=recovered_corrupt_path
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?)',(url,json.dumps(value,ensure_ascii=False)))
         return value
@@ -126,12 +160,15 @@ class Downloader:
             visited.add(url)
             event=dict(url=url,at=now(),depth=depth,pipeline_version=VERSION,
                        input_sha256=self.input_sha)
+            if getattr(client,'run_id',None): event['run_id']=client.run_id
             try:
                 result=self.obtain(client,url,refresh=retry)
-                event.update(final_url=result['url'],kind=result['kind'],sha256=result['sha256'],cached=result['cached'])
+                event.update(final_url=result['url'],kind=result['kind'],sha256=result['sha256'],
+                             bytes=result['bytes'],cached=result['cached'])
                 if result['kind']=='pdf':
-                    files[result['sha256']]=dict(result,validation='assinatura_e_EOF',document_role='nao_verificado')
-                    event['status']='pdf_obtido'
+                    duplicate=result['sha256'] in files
+                    files.setdefault(result['sha256'],dict(result,validation='assinatura_e_EOF',document_role='nao_verificado'))
+                    event['status']='pdf_duplicado' if duplicate else 'pdf_obtido'
                 elif result['kind']=='html':
                     raw=(self.directory/result['path']).read_bytes()
                     if len(raw)>10*1024**2: raise FetchError('html_grande','Página HTML excede 10 MiB para parsing.')
@@ -183,6 +220,16 @@ class Downloader:
         atomic(self.directory/'staging/metadata_html.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in metadata))
         reasons=collections.Counter(a['status'] for r in rows for a in r['attempts'])
         unique={f['sha256']:f['bytes'] for r in rows for f in r['files']}
+        pdf_events=[a for r in rows for a in r['attempts']
+                    if a['status'] in ('pdf_obtido','pdf_duplicado')]
+        seen_pdf=set()
+        duplicate_events=[]
+        for event in pdf_events:
+            if event.get('sha256') in seen_pdf or event['status']=='pdf_duplicado':
+                duplicate_events.append(event)
+            seen_pdf.add(event.get('sha256'))
+        duplicate_bytes=sum(a.get('bytes',unique.get(a.get('sha256'),0)) for a in duplicate_events)
+        run_ids=collections.Counter(a['run_id'] for r in rows for a in r['attempts'] if a.get('run_id'))
         domains=collections.defaultdict(collections.Counter)
         for r in rows:
             if r['attempts']: domains[urlsplit(r['attempts'][0]['url']).netloc][r['status']]+=1
@@ -194,13 +241,16 @@ class Downloader:
                     input_records=total_input,processed_records=len(rows),
                     remaining_records=total_input-len(rows),statuses=dict(collections.Counter(r['status'] for r in rows)),
                     unique_pdfs=len(unique),pdf_bytes=sum(unique.values()),attempt_statuses=dict(reasons),
+                    pdf_responses=len(pdf_events),duplicate_pdf_responses=len(duplicate_events),
+                    duplicate_pdf_bytes=duplicate_bytes,
+                    run_ids=dict(run_ids),
                     failure_stages=dict(stages),
                     by_initial_domain={d:dict(c) for d,c in domains.items()},
                     semantic_validation=False,text_extraction=False,area_validated=False,
                     results=[dict(record_id=r['record_id'],status=r['status'],pdfs=len(r['files']),
                                   pipeline_version=r['pipeline_version'],limited=r['limited'],
-                                  reasons=[a.get('reason',a['status']) for a in r['attempts'] if a['status']!='pdf_obtido'],
-                                  attempts=[{k:a[k] for k in ('url','final_url','status','reason','details') if k in a}
+                                  reasons=[a.get('reason',a['status']) for a in r['attempts'] if a['status'] not in COMPLETED_ATTEMPTS],
+                                  attempts=[{k:a[k] for k in ('url','final_url','status','reason','details','sha256','bytes','cached','run_id') if k in a}
                                             for a in r['attempts']]) for r in rows])
         atomic(self.directory/'reports/pdf_pilot.json',json.dumps(report,ensure_ascii=False,indent=2))
         return report
@@ -251,11 +301,15 @@ def main():
                 elif not args.retry_failed: continue
             if attempted>=args.limit or client.transferred>=client.budget: break
             print('Processando:',row['record_id'],flush=True)
-            result=worker.process(row,client,retry=args.retry_failed)
+            client.record_id=row['record_id']
+            try:
+                result=worker.process(row,client,retry=args.retry_failed)
+            finally:
+                client.record_id=None
             attempted+=1
             worker.export(len(rows))
             print(result['status'], '-',len(result['files']),'PDF(s)',flush=True)
-            if client.transferred>=client.budget: break
+            if client.transferred>=client.budget or any(a['status']=='limite_execucao' for a in result['attempts']): break
         report=worker.export(len(rows))
         print('PDFs únicos:',report['unique_pdfs'])
         print('Relatório:',(args.data_dir/'reports/pdf_pilot.json').resolve())
