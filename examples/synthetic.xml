@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" xmlns:oai_dc="http://www.openarchives.org/OAI/2.0/oai_dc/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<responseDate>2026-09-11T00:00:00Z</responseDate><request verb="ListRecords" metadataPrefix="oai_dc">https://example.org/oai</request>
+<ListRecords>
+<record><header><identifier>oai:synthetic:001</identifier><datestamp>2026-01-01</datestamp><setSpec>demo</setSpec></header><metadata><oai_dc:dc>
+<dc:title xml:lang="pt">EXEMPLO SINTÉTICO: comunicação e leitura</dc:title><dc:title xml:lang="en">SYNTHETIC EXAMPLE: communication and reading</dc:title><dc:creator>Autor Fictício A</dc:creator><dc:description xml:lang="pt">Resumo fictício para testar a preservação dos metadados. Não representa uma tese real.</dc:description><dc:description xml:lang="en">Synthetic abstract for testing only.</dc:description><dc:subject>Comunicação</dc:subject><dc:publisher>Instituição Fictícia</dc:publisher><dc:date>2025</dc:date><dc:date>2026-01-01</dc:date><dc:language>por</dc:language><dc:identifier>https://example.org/001</dc:identifier>
+</oai_dc:dc></metadata></record>
+<record><header><identifier>oai:synthetic:002</identifier><datestamp>2026-01-02</datestamp></header><metadata><oai_dc:dc><dc:title>EXEMPLO SINTÉTICO: variação linguística</dc:title><dc:creator>Autor Fictício B</dc:creator></oai_dc:dc></metadata></record>
+<record><header status="deleted"><identifier>oai:synthetic:003</identifier><datestamp>2026-01-03</datestamp></header></record>
+</ListRecords></OAI-PMH>

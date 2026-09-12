@@ -1,0 +1,10 @@
+{
+  "interval_seconds": 1.0,
+  "timeout_seconds": 25,
+  "candidates": [
+    {"kind": "html", "url": "https://bdtd.ibict.br/vufind/"},
+    {"kind": "oai", "verb": "Identify", "url": "https://bdtd.ibict.br/vufind/OAI/Server?verb=Identify"},
+    {"kind": "oai", "verb": "ListSets", "url": "https://bdtd.ibict.br/vufind/OAI/Server?verb=ListSets"},
+    {"kind": "api", "url": "https://bdtd.ibict.br/vufind/api/v1/search?lookfor=linguagem&type=AllFields"}
+  ]
+}

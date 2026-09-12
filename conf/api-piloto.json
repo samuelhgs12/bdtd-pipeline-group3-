@@ -1,0 +1,13 @@
+{
+  "endpoint": "https://bdtd.ibict.br/vufind/api/v1/search",
+  "lookfor": "Linguagem OR Comunicação",
+  "type": "Subject",
+  "filters": [
+    "~format:\"masterThesis\"",
+    "~format:\"doctoralThesis\""
+  ],
+  "limit": 20,
+  "browser_reference_total": 30476,
+  "browser_reference_date": "2026-09-11",
+  "scope": "Consulta exploratória; equivalência com a busca avançada e recorte da área ainda pendentes"
+}
