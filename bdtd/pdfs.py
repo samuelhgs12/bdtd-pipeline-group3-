@@ -6,16 +6,27 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from .core import atomic, digest, now
 from .pdf_http import FetchError, StreamClient, clean_url
 
-VERSION='0.3.2'
+VERSION='0.3.3'
 LIMIT_STATUSES={'limite_arquivo','limite_execucao','limite_profundidade',
                 'redirect_limite','html_grande'}
 COMPLETED_ATTEMPTS={'pdf_obtido','pdf_duplicado','links_localizados'}
+
+
+def obvious_site_document(url):
+    """Reconhece PDFs institucionais inequívocos que aparecem em menus/rodapés."""
+    name=unquote(urlsplit(url).path.rsplit('/',1)[-1]).casefold()
+    name=''.join(c for c in unicodedata.normalize('NFKD',name) if not unicodedata.combining(c))
+    compact=re.sub(r'[^a-z0-9]+','-',name).strip('-')
+    markers=('politica-de-informacao','politica-de-privacidade','privacy-policy',
+             'termos-de-uso','terms-of-use','politica-do-repositorio')
+    return any(marker in compact for marker in markers)
 
 
 def candidate_identity(url):
@@ -36,6 +47,7 @@ class Links(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base=base
         self.candidates=[]
+        self.filtered_candidates=[]
         self.identity_indexes={}
         self.metadata=collections.defaultdict(list)
     def handle_starttag(self, tag, attrs):
@@ -45,7 +57,7 @@ class Links(HTMLParser):
             value=a.get('content')
             if name and value and (name.startswith('citation_') or name.startswith('dc.') or name.startswith('dcterms.')):
                 self.metadata[name].append(value)
-            if name=='citation_pdf_url' and value: self.add(value)
+            if name=='citation_pdf_url' and value: self.add(value,source='citation_pdf_url')
         if tag in ('a','link','iframe','embed','object'):
             value=a.get('href') or a.get('src') or a.get('data')
             if value:
@@ -53,10 +65,13 @@ class Links(HTMLParser):
                 if '.pdf' in low or '/bitstream/' in low or ('/bitstreams/' in low and '/download' in low) or a.get('type')=='application/pdf':
                     # Miniaturas/arquivos auxiliares de texto não são candidatos PDF.
                     if not any(urlsplit(low).path.endswith(x) for x in ('.jpg','.png','.gif','.txt','.xml','.zip')):
-                        self.add(value)
-    def add(self, value):
+                        self.add(value,source=tag)
+    def add(self, value, source=None):
         try: url=clean_url(urljoin(self.base,value))
         except (ValueError,FetchError): return
+        if source!='citation_pdf_url' and obvious_site_document(url):
+            self.filtered_candidates.append(dict(url=url,reason='documento_institucional_do_site'))
+            return
         identity=candidate_identity(url)
         if identity in self.identity_indexes:
             index=self.identity_indexes[identity]
@@ -182,6 +197,8 @@ class Downloader:
                     if metadata not in extracted: extracted.append(metadata)
                     candidates=[u for u in parser.candidates if u not in visited and not already_obtained(u)]
                     event['candidates_found']=len(candidates)
+                    if parser.filtered_candidates:
+                        event['filtered_candidates']=parser.filtered_candidates
                     if candidates and depth==0:
                         queue.extend((u,1) for u in candidates[:8])
                         limited=limited or len(candidates)>8
@@ -220,6 +237,10 @@ class Downloader:
         atomic(self.directory/'staging/metadata_html.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in metadata))
         reasons=collections.Counter(a['status'] for r in rows for a in r['attempts'])
         unique={f['sha256']:f['bytes'] for r in rows for f in r['files']}
+        site_documents={f['sha256']:f['bytes'] for r in rows for f in r['files']
+                        if obvious_site_document(f.get('url',''))}
+        candidate_work_files={f['sha256']:f['bytes'] for r in rows for f in r['files']
+                              if not obvious_site_document(f.get('url',''))}
         pdf_events=[a for r in rows for a in r['attempts']
                     if a['status'] in ('pdf_obtido','pdf_duplicado')]
         seen_pdf=set()
@@ -241,6 +262,10 @@ class Downloader:
                     input_records=total_input,processed_records=len(rows),
                     remaining_records=total_input-len(rows),statuses=dict(collections.Counter(r['status'] for r in rows)),
                     unique_pdfs=len(unique),pdf_bytes=sum(unique.values()),attempt_statuses=dict(reasons),
+                    candidate_work_pdfs=len(candidate_work_files),
+                    site_document_pdfs=len(site_documents),
+                    possible_extra_candidate_files=sum(max(0,sum(not obvious_site_document(f.get('url',''))
+                                                                  for f in r['files'])-1) for r in rows),
                     pdf_responses=len(pdf_events),duplicate_pdf_responses=len(duplicate_events),
                     duplicate_pdf_bytes=duplicate_bytes,
                     run_ids=dict(run_ids),
@@ -248,6 +273,8 @@ class Downloader:
                     by_initial_domain={d:dict(c) for d,c in domains.items()},
                     semantic_validation=False,text_extraction=False,area_validated=False,
                     results=[dict(record_id=r['record_id'],status=r['status'],pdfs=len(r['files']),
+                                  candidate_work_pdfs=sum(not obvious_site_document(f.get('url','')) for f in r['files']),
+                                  site_document_pdfs=sum(obvious_site_document(f.get('url','')) for f in r['files']),
                                   pipeline_version=r['pipeline_version'],limited=r['limited'],
                                   reasons=[a.get('reason',a['status']) for a in r['attempts'] if a['status'] not in COMPLETED_ATTEMPTS],
                                   attempts=[{k:a[k] for k in ('url','final_url','status','reason','details','sha256','bytes','cached','run_id') if k in a}

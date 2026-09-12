@@ -1,69 +1,114 @@
-# Checkpoint — 12/09/2026
+# Checkpoint — validação da coleta em 12/09/2026
 
-## Estado atual
+## Escopo desta etapa
 
-O projeto contém as etapas Raw e Staging de metadados, o piloto da API BDTD e o piloto de download de PDFs. A consulta exploratória continua sendo `Linguagem OR Comunicação` no campo `Subject`, limitada a `masterThesis` e `doctoralThesis`. A API informou 30.476 resultados e as duas páginas já coletadas contêm 40 registros distintos, 39 com links. Esse recorte ainda não foi validado como cobertura integral da área definida pelo professor.
+Esta etapa validou o novo recorte da API, mediu a paginação real, selecionou uma amostra reproduzível de 50 trabalhos, tentou seus downloads e preparou a revisão humana de pertinência. Não foi implementada extração de texto e não foi iniciada coleta em grande escala. Os recortes anteriores, bancos SQLite, Raw e diretórios de download foram preservados.
 
-As duas rodadas reais do piloto de PDFs processaram os 16 primeiros registros do snapshot. O resultado preservado em `data/pdf-piloto` contém quatro sucessos, 11 registros `nao_obtido`, um `sem_link_origem` e 24 registros ainda não processados. Foram obtidos quatro PDFs distintos, com 21.300.021 bytes no Raw.
+## Consulta validada
 
-## Diagnóstico do piloto real
+A consulta representa os campos separadamente, sem usar `AllFields`:
 
-O relatório, o manifesto e os payloads do SQLite são consistentes. O `PRAGMA quick_check` do banco, aberto em modo somente leitura, retornou `ok`. O hash do snapshot corresponde à configuração no banco e os arquivos de `robots.txt` arquivados correspondem aos SHA-256 usados em seus nomes. Há 16 resultados, 23 tentativas históricas e 12 respostas no cache.
+```text
+(Subject:Linguagem OR Abstract:Linguagem OR
+ Subject:Comunicação OR Abstract:Comunicação)
+AND
+(format:masterThesis OR format:doctoralThesis)
+```
 
-Na primeira rodada, nenhuma página de trabalho ou URL de PDF chegou a ser requisitada. As oito requisições registradas foram exclusivamente para `robots.txt`, incluindo o redirecionamento HTTP para HTTPS da FURB:
+Na API VuFind, ela foi enviada como um grupo avançado com `join=AND`, `bool0[]=OR`, quatro pares repetidos de `lookfor0[]` e `type0[]`, e dois `filter[]` para os tipos. A configuração integral está em `conf/api-validacao-linguagem-comunicacao.json`.
 
-- Bahiana: timeout ao consultar `robots.txt`.
-- PUC Minas: três timeouts ao consultar `robots.txt`, um para cada registro.
-- FURB: bloqueio confirmado; a política arquivada contém `Disallow: /docs/`, que abrange a URL recebida.
-- PUC-SP: duas respostas HTTP 403 ao consultar `robots.txt`.
+Em 12/09/2026, a API informou **115.070 resultados**, exatamente o valor de referência observado no navegador. Duas páginas com `limit=20` retornaram 40 IDs distintos. Os parâmetros, horários, URLs, hashes e respostas estão arquivados em `data/validacao-linguagem-comunicacao/api/`.
 
-As quatro falhas por timeout foram registradas pela versão 0.3.0 como `erro_rede_ou_processamento`. Elas ocorreram na verificação de política e não demonstram falha do PDF. O histórico não foi reclassificado nem reescrito.
+Essa igualdade confirma a representação técnica da consulta observada. Ela não comprova, por si só, cobertura integral da área acadêmica “Linguagem e Comunicação”; essa validação continua dependendo da revisão do professor e da amostra.
 
-Na segunda rodada, executada com a versão 0.3.1, quatro dos oito novos registros tiveram sucesso:
+## Limite real de paginação
 
-- UFMG: dois PDFs, com 7.879.437 e 10.838.209 bytes.
-- UFSC: dois PDFs, com 348.622 e 2.233.753 bytes.
+O diagnóstico comparou `limit=1`, `20` e `100`. A API mantém `resultCount=115070`, porém só permite avançar nas primeiras **1.000 posições**:
 
-Os quatro arquivos conferem com o SHA-256 do manifesto, começam com uma assinatura PDF, contêm marcador `%%EOF` e apresentam contagens internas plausíveis de 213, 191, 68 e 166 páginas. Os títulos e autores das páginas HTML correspondem aos registros de origem. Isso valida download e associação em nível técnico básico; não equivale a validar todo o texto extraído.
+- com `limit=1`, a página 1.001 repete exatamente o ID da página 1.000;
+- com `limit=20`, a página 51 repete a página 50;
+- com `limit=100`, a página 11 repete a página 10;
+- páginas muito mais profundas também repetem a última resposta da janela, em vez de retornar erro ou página vazia.
 
-As quatro falhas da segunda rodada foram: HTTP 403 no `robots.txt` da UFPE; HTTP 500 do Handle em dois registros da UFPR, após tentativas limitadas; e falha de validação da cadeia TLS da UFRGS. A verificação TLS não foi desativada.
+O relatório e as 31 respostas de prova estão em `data/validacao-linguagem-comunicacao/pagination-probe/`. Uma tentativa inicial de sortear sobre as 115.070 posições detectou IDs repetidos e foi interrompida antes de qualquer download; seus dados permanecem em `data/validacao-linguagem-comunicacao/sample/`. O relatório dessa tentativa não deve ser usado como amostra completa.
 
-## Mudanças das versões 0.3.1 e 0.3.2
+## Amostra de 50
 
-- Diagnósticos HTTP novos registram fase (`robots` ou `resource`), URL efetiva, status HTTP, causa, número da tentativa e evidência da política arquivada.
-- Timeout e erro de rede durante a consulta à política são classificados como `robots_indisponivel`. Códigos de limite e `Retry-After` permanecem distintos.
-- Falhas de política são reutilizadas por origem somente na instância atual do cliente. Isso evita repetir o mesmo timeout ou HTTP 403 para vários registros, sem transformar a falha em permissão persistente. Uma nova execução consulta a política novamente.
-- Redirecionamentos continuam limitados e cada destino tem sua própria política verificada. Bloqueios, autenticação e desafios não são contornados.
-- O orçamento é verificado antes de iniciar novas requisições e durante o streaming. Respostas parciais continuam sendo removidas; os limites encerram a execução de modo retomável.
-- Registros interrompidos por limite agora recebem `limited: true` de forma consistente.
-- `--retry-failed` também retoma sucessos parciais. PDFs íntegros e metadados já obtidos são preservados, e candidatos ainda não obtidos têm prioridade nas execuções seguintes.
-- Se um objeto esperado estiver corrompido, seus bytes são preservados em `raw/corrupt/` e a cópia válida baixada pode restaurar o caminho endereçado pelo hash.
-- O relatório novo inclui hash da entrada, versões dos resultados, fase das falhas e resumo das tentativas. Resultados históricos 0.3.0 continuam compatíveis.
-- A versão 0.3.2 deduplica variantes conhecidas do mesmo bitstream DSpace antes do download. Aplicado aos quatro HTMLs reais, o parser passou de dois candidatos para um candidato por registro.
-- Quando URLs não reconhecidas ainda entregarem bytes idênticos, a segunda resposta será registrada como `pdf_duplicado`; o relatório informará quantidade e bytes duplicados.
-- `links_localizados` deixou de aparecer como motivo de falha em registros bem-sucedidos.
-- Redirects de `robots.txt` para a política canônica HTTPS podem reutilizar a política confirmada durante a mesma execução.
-- Erros de certificado são identificados como `tls_verification`, mantendo a validação TLS obrigatória.
-- Novos logs recebem `run_id` e `record_id`, permitindo correlacionar requisições, execução e registro.
+A amostra final usa seed fixa **20260912** e `random.Random(seed).sample(range(1, 1001), 50)`, com uma requisição `limit=1` para cada posição. Foram obtidos 50 IDs distintos, entre as posições 31 e 991. A distribuição pelos dez décimos da janela foi `8, 4, 5, 1, 7, 6, 6, 4, 4, 5`.
 
-## Verificações
+Essa é uma amostra aleatória reproduzível da **janela acessível das primeiras 1.000 posições na ordenação padrão da API**. Ela não é uma amostra aleatória dos 115.070 resultados informados. A ordenação também não é um snapshot imutável; mudanças futuras no índice podem mudar o registro de uma posição.
 
-Ambiente: Windows, Python 3.14.0 (`C:\Python314\python.exe`).
+A lista foi salva antes dos downloads, com SHA-256 `18c40823a408f62405558b885ffb5bebd4d4e59fba15eea006b5e978c0f59199`, em:
 
-- `python -m unittest discover -s tests -v`: 57 testes passaram.
-- Os 27 testes anteriores continuam passando.
-- Foram acrescentados testes simulados para política indisponível, cache transitório, nova consulta em nova execução, redirecionamentos, fechamento de respostas HTTP, limites exatos, logs, preservação da política, retomada em lotes de oito, sucesso parcial, avanço além de oito anexos, recuperação sem perda de objeto corrompido, deduplicação DSpace e classificação TLS.
-- Os testes usam diretórios temporários e respostas simuladas; não fizeram coleta real.
-- O banco, o manifesto, o relatório, os logs e os diretórios existentes do piloto não foram apagados nem reinicializados.
+- `data/validacao-linguagem-comunicacao/sample-accessible/selected_50.jsonl`;
+- `data/validacao-linguagem-comunicacao/sample-accessible/selected_50.csv`;
+- `data/validacao-linguagem-comunicacao/sample-accessible/sample_report.json`.
 
-## Limitações
+## Resultado dos downloads
 
-O acesso real a PDFs foi comprovado para dois registros da UFMG e dois da UFSC. Isso não permite generalizar a taxa de sucesso para todas as instituições. A assinatura `%PDF-`, o marcador `%%EOF`, o checksum e o tamanho HTTP são verificações básicas; não comprovam estrutura integral, correspondência semântica de todas as páginas ou qualidade de extração. Ainda não há extração de texto, OCR, classificação entre corpo principal e anexos, Processed, Curated, índice RAG ou benchmarks.
+Todos os 50 trabalhos selecionados foram processados com o contato configurado, espera mínima por domínio, verificação de `robots.txt`, até 100 MiB por arquivo e orçamento de 500 MiB na execução.
 
-A versão 0.3.1 recebeu 43.603.035 bytes em respostas de recursos. Cada um dos quatro PDFs foi transferido duas vezes por URLs DSpace equivalentes, embora o Raw tenha armazenado apenas uma cópia de cada SHA-256. A versão 0.3.2 corrige os quatro padrões observados; o relatório histórico foi mantido sem reescrita.
+- trabalhos selecionados: **50**;
+- trabalhos com pelo menos um PDF candidato do trabalho: **17**;
+- taxa de sucesso por trabalho: **34%**;
+- PDFs únicos efetivamente baixados no Raw: **20** (52.831.365 bytes);
+- PDFs candidatos a arquivo dos trabalhos: **19**;
+- documento institucional do site: **1**;
+- trabalhos com múltiplos PDFs candidatos: **2**;
+- possíveis arquivos adicionais/anexos ainda não verificados: **2**;
+- resultados sem PDF obtido: **29**;
+- registros sem URL de origem na resposta da API: **4**.
 
-Também permanecem pendentes a validação acadêmica do recorte “Linguagem e Comunicação”, o enriquecimento dos registros sem URL e a avaliação de plataformas institucionais que dependem de JavaScript ou endpoints específicos, sempre respeitando `robots.txt` e controles de acesso.
+O PDF institucional é “Política de Informação do Repositório Locus — UFV”, encontrado no menu/rodapé da página. Seus bytes e o evento histórico foram preservados, mas ele foi separado dos arquivos candidatos dos trabalhos. A versão 0.3.3 agora filtra, com registro explícito, nomes inequívocos de políticas de informação, privacidade e termos de uso encontrados como links comuns. URLs indicadas por `citation_pdf_url` continuam elegíveis.
+
+Entre as ocorrências sem sucesso houve 23 `robots_indisponivel` (13 respostas HTTP que não confirmaram a política, quatro timeouts, três políticas retornadas como HTML inválido e três falhas de validação TLS), um `robots_bloqueado`, cinco HTTP 500 em recursos, duas respostas com PDF inválido/incompleto e três páginas sem link PDF. Nenhuma política indisponível foi tratada como permissão; bloqueios, TLS e controles de acesso não foram contornados.
+
+Os resultados estão em:
+
+- `data/validacao-linguagem-comunicacao/pdf-sample-50/reports/pdf_pilot.json`;
+- `data/validacao-linguagem-comunicacao/pdf-sample-50/raw/manifest_pdf.jsonl`;
+- `data/validacao-linguagem-comunicacao/pdf-sample-50/logs/http.jsonl`;
+- `data/validacao-linguagem-comunicacao/pdf-sample-50/raw/pdf/`.
+
+## Revisão de pertinência
+
+A tabela contém os 50 trabalhos, inclusive os 33 sem PDF candidato. Ela reúne ID, título, resumo disponível, assuntos, URL de origem, resultado do download, classificação preliminar, justificativa curta e a coluna vazia `final_decision`.
+
+A API de busca não forneceu resumo para nenhum dos 50 registros. Metadados HTML obtidos durante o download acrescentaram resumo para cinco; os demais 45 campos foram mantidos vazios. Nenhum resumo foi inventado.
+
+A triagem preliminar resultou em **46 pertinentes, dois não pertinentes e dois duvidosos**. Os dois não pertinentes tratam de linguagem de programação/computação. Os casos duvidosos têm título truncado ou evidência temática insuficiente. Nenhum registro foi excluído e a classificação não representa validação humana.
+
+Arquivos para revisão:
+
+- `data/validacao-linguagem-comunicacao/review/review_50.csv` — planilha a preencher;
+- `data/validacao-linguagem-comunicacao/review/review_50.jsonl` — versão estruturada;
+- `data/validacao-linguagem-comunicacao/review/review_report.json` — taxas separadas de download e pertinência;
+- `conf/triagem-validacao-20260912.json` — decisões preliminares e justificativas rastreáveis.
+
+## Comandos executados
+
+O e-mail foi lido com `git config user.email` e passado a `--contact` sem ser gravado nos relatórios.
+
+```powershell
+C:\Python314\python.exe -X utf8 -m bdtd.api --contact $bdtdContact --data-dir data\validacao-linguagem-comunicacao\api --config conf\api-validacao-linguagem-comunicacao.json --pages 2
+
+C:\Python314\python.exe -X utf8 -m bdtd.pagination_probe --contact $bdtdContact --config conf\api-validacao-linguagem-comunicacao.json --data-dir data\validacao-linguagem-comunicacao\pagination-probe
+
+C:\Python314\python.exe -X utf8 -m bdtd.sample --contact $bdtdContact --config conf\api-validacao-linguagem-comunicacao.json --data-dir data\validacao-linguagem-comunicacao\sample-accessible --seed 20260912 --size 50 --frame-size 1000
+
+C:\Python314\python.exe -X utf8 -m bdtd.pdfs --input data\validacao-linguagem-comunicacao\sample-accessible\selected_50.jsonl --data-dir data\validacao-linguagem-comunicacao\pdf-sample-50 --contact $bdtdContact --limit 50 --max-mb 100 --budget-mb 500
+
+C:\Python314\python.exe -X utf8 -m bdtd.review --sample data\validacao-linguagem-comunicacao\sample-accessible\selected_50.jsonl --manifest data\validacao-linguagem-comunicacao\pdf-sample-50\raw\manifest_pdf.jsonl --metadata-html data\validacao-linguagem-comunicacao\pdf-sample-50\staging\metadata_html.jsonl --triage conf\triagem-validacao-20260912.json --output-dir data\validacao-linguagem-comunicacao\review
+
+C:\Python314\python.exe -X utf8 -m unittest discover -s tests -v
+```
+
+## Verificações e limitações
+
+Os **66 testes** passaram no Python 3.14.0. `PRAGMA quick_check` retornou `ok` nos cinco bancos desta validação, inclusive no banco da tentativa de amostragem interrompida. A entrada dos downloads confere com o hash da lista selecionada e os resultados abrangem exatamente os 50 IDs. Os arquivos Raw anteriores não foram removidos ou substituídos.
+
+A taxa de 34% mede somente esta amostra da janela acessível e é afetada pela distribuição de repositórios e suas políticas. Assinatura PDF, marcador de fim, tamanho e SHA-256 confirmam a integridade técnica básica, mas não confirmam conteúdo integral, correspondência semântica ou papel de anexos. A cobertura além das primeiras 1.000 posições exige outro mecanismo oficial de paginação ou particionamento de consulta antes de qualquer inferência populacional.
 
 ## Próximo passo
 
-Abrir os quatro PDFs obtidos e testar extração de texto, registrando páginas, erros e correspondência com título/autor antes de ampliar o piloto. Depois dessa validação, executar no máximo mais oito registros com a versão 0.3.2. Falhas HTTP e de política podem ser reavaliadas posteriormente com `--retry-failed`, mas qualquer bloqueio e falha TLS deve continuar sendo respeitado. Não iniciar coleta em massa enquanto a qualidade textual e o recorte da área não estiverem validados.
+Revisar `review_50.csv` e preencher `final_decision` para os 50 trabalhos. Depois da decisão humana, avaliar com o professor a adequação do recorte e investigar um particionamento oficial e não sobreposto da consulta que contorne a limitação estatística da janela sem contornar controles de acesso. A extração de texto permanece adiada.

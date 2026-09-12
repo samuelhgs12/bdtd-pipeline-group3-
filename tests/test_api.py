@@ -52,6 +52,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(params['filter[]'],CONFIG['filters'])
         self.assertEqual(params['type'],['Subject'])
         self.assertEqual(params['lookfor'],['Linguagens OR Comunicação'])
+
+    def test_advanced_group_preserves_fields_and_or_operator(self):
+        config=dict(CONFIG, groups=[dict(operator='OR',clauses=[
+            dict(lookfor='Linguagem',type='Subject'),
+            dict(lookfor='Linguagem',type='Abstract'),
+            dict(lookfor='Comunicação',type='Subject'),
+            dict(lookfor='Comunicação',type='Abstract')])],join='AND')
+        config.pop('lookfor'); config.pop('type')
+        params=parse_qs(urlsplit(build_url(config,3)).query)
+        self.assertEqual(params['join'],['AND'])
+        self.assertEqual(params['bool0[]'],['OR'])
+        self.assertEqual(params['lookfor0[]'],['Linguagem','Linguagem','Comunicação','Comunicação'])
+        self.assertEqual(params['type0[]'],['Subject','Abstract','Subject','Abstract'])
+        self.assertEqual(params['page'],['3'])
     def test_normalization_keeps_original(self):
         row=validate(response([1,2]))['records'][0]
         out=normalize(row,{})

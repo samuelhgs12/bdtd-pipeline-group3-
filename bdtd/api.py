@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 from .core import atomic, digest, now
 from .network import Client
 
-VERSION = '0.2.0'
+VERSION = '0.4.0'
 
 def validate(data):
     obj = json.loads(data)
@@ -44,17 +44,27 @@ def normalize(row, provenance):
     urls = row.get('urls', [])
     if not isinstance(urls, list):
         urls = []
+    abstracts = strings(row.get('abstracts', row.get('abstract', row.get('description', []))))
     return dict(record_id=row['id'], title=row['title'],
                 authors=list(primary) if isinstance(primary, dict) else strings(primary),
                 formats=strings(row.get('formats', [])), languages=strings(row.get('languages', [])),
-                subjects=strings(row.get('subjects', [])),
+                subjects=strings(row.get('subjects', [])), abstracts=abstracts,
                 urls=[u['url'] for u in urls if isinstance(u, dict) and isinstance(u.get('url'), str)],
                 area_status='consulta_exploratoria_nao_validada', metadata_level='search',
                 original_record=row, **provenance)
 
-def build_url(config, page):
-    params = [('lookfor', config['lookfor']), ('type', config['type']),
-              ('page', str(page)), ('limit', str(config['limit']))]
+def build_url(config, page, limit=None):
+    params = []
+    if config.get('groups'):
+        params.append(('join', config.get('join', 'AND')))
+        for index, group in enumerate(config['groups']):
+            params.append((f'bool{index}[]', group['operator']))
+            for clause in group['clauses']:
+                params.append((f'lookfor{index}[]', clause['lookfor']))
+                params.append((f'type{index}[]', clause['type']))
+    else:
+        params += [('lookfor', config['lookfor']), ('type', config['type'])]
+    params += [('page', str(page)), ('limit', str(limit if limit is not None else config['limit']))]
     params += [('filter[]', value) for value in config['filters']]
     return config['endpoint'] + '?' + urlencode(params)
 
@@ -141,7 +151,7 @@ class Pilot:
                  for r in self.db.execute('SELECT * FROM pages ORDER BY page')]
         atomic(self.directory / 'staging/api_metadados.jsonl', ''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows))
         buffer = io.StringIO(newline='')
-        writer = csv.writer(buffer, delimiter=';')
+        writer = csv.writer(buffer, delimiter=';', lineterminator='\n')
         writer.writerow(['id','titulo','autores','tipos','idiomas','assuntos','links','pagina'])
         for r in rows:
             values = [r['record_id'], r['title'], ' | '.join(r['authors']), ' | '.join(r['formats']),
