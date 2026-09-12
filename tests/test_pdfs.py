@@ -38,6 +38,13 @@ class PDFTests(unittest.TestCase):
         self.assertEqual(len(p.candidates),2)
         self.assertEqual(p.metadata['dc.description'],['Resumo'])
 
+    def test_obvious_repository_policy_pdf_is_filtered(self):
+        p=Links('https://example.org/item/1')
+        p.feed('<a href="/assets/Politica-de-Informacao-do-Repositorio.pdf">Política</a>'
+               '<a href="/bitstream/main.pdf">Trabalho</a>')
+        self.assertEqual(p.candidates,['https://example.org/bitstream/main.pdf'])
+        self.assertEqual(p.filtered_candidates[0]['reason'],'documento_institucional_do_site')
+
     def test_equivalent_dspace_candidates_are_deduplicated(self):
         p=Links('https://example.org/handle/123/456')
         p.feed('''<link href="https://example.org//bitstreams/id/download">
