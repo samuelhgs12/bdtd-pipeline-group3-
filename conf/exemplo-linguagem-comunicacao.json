@@ -1,0 +1,23 @@
+{
+  "endpoint": "https://bdtd.ibict.br/vufind/api/v1/search",
+  "join": "AND",
+  "groups": [
+    {
+      "operator": "OR",
+      "clauses": [
+        {"lookfor": "Linguagem", "type": "Subject"},
+        {"lookfor": "Linguagem", "type": "Abstract"},
+        {"lookfor": "Comunicação", "type": "Subject"},
+        {"lookfor": "Comunicação", "type": "Abstract"}
+      ]
+    }
+  ],
+  "filters": [
+    "~format:\"masterThesis\"",
+    "~format:\"doctoralThesis\""
+  ],
+  "limit": 20,
+  "browser_reference_total": 115070,
+  "browser_reference_date": "2026-09-12",
+  "scope": "Assunto:Linguagem OU Resumo:Linguagem OU Assunto:Comunicação OU Resumo:Comunicação; tipos Dissertação/Tese; recorte em validação"
+}
