@@ -13,9 +13,9 @@ from urllib.parse import unquote, urljoin, urlsplit
 from .core import atomic, digest, now
 from .pdf_http import FetchError, StreamClient, clean_url
 
-VERSION='0.3.3'
+VERSION='0.4.0'
 LIMIT_STATUSES={'limite_arquivo','limite_execucao','limite_profundidade',
-                'redirect_limite','html_grande'}
+                'redirect_limite','html_grande','disco_reserva'}
 COMPLETED_ATTEMPTS={'pdf_obtido','pdf_duplicado','links_localizados'}
 
 
@@ -91,7 +91,7 @@ def pdf_signature(path):
     return first.lstrip().startswith(b'%PDF-') and b'%%EOF' in end
 
 class Downloader:
-    def __init__(self, directory, input_bytes):
+    def __init__(self, directory, input_bytes, allow_growing_input=False):
         self.directory=Path(directory)
         self.directory.mkdir(parents=True,exist_ok=True)
         self.input_sha=digest(input_bytes)
@@ -102,15 +102,27 @@ class Downloader:
         CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, payload TEXT);
         CREATE TABLE IF NOT EXISTS attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT, payload TEXT);
         ''')
-        old=self.db.execute('SELECT sha FROM settings WHERE id=1').fetchone()
-        if old and old[0]!=self.input_sha:
-            self.db.close()
-            raise ValueError('Entrada mudou. Use outro --data-dir para preservar o snapshot anterior.')
-        with self.db: self.db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)',(self.input_sha,))
         source=self.directory/'raw/input'/ (self.input_sha+'.jsonl')
         source.parent.mkdir(parents=True,exist_ok=True)
         if not source.exists(): source.write_bytes(input_bytes)
         elif digest(source.read_bytes()) != self.input_sha: raise ValueError('Snapshot de entrada corrompido.')
+        old=self.db.execute('SELECT sha FROM settings WHERE id=1').fetchone()
+        if old and old[0]!=self.input_sha:
+            if not allow_growing_input:
+                self.db.close()
+                raise ValueError('Entrada mudou. Use outro --data-dir para preservar o snapshot anterior.')
+            previous_path=self.directory/'raw/input'/(old[0]+'.jsonl')
+            if not previous_path.exists() or digest(previous_path.read_bytes())!=old[0]:
+                self.db.close()
+                raise ValueError('Snapshot anterior ausente ou corrompido; crescimento recusado.')
+            previous={row['record_id']:row for row in load_rows(previous_path.read_bytes())}
+            current={row['record_id']:row for row in load_rows(input_bytes)}
+            if not previous.keys()<=current.keys() or any(current[key]!=value for key,value in previous.items()):
+                self.db.close()
+                raise ValueError('A nova entrada não é uma extensão imutável da anterior.')
+            with self.db: self.db.execute('UPDATE settings SET sha=? WHERE id=1',(self.input_sha,))
+        else:
+            with self.db: self.db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)',(self.input_sha,))
 
     def obtain(self, client, url, refresh=False):
         cached=self.db.execute('SELECT payload FROM cache WHERE url=?',(url,)).fetchone()
@@ -143,18 +155,24 @@ class Downloader:
                 counter+=1
             os.replace(dest,corrupt_dest)
             recovered_corrupt_path=corrupt_dest.relative_to(self.directory).as_posix()
-        os.replace(path,dest)
+        if dest.exists():
+            path.unlink()
+        else:
+            os.replace(path,dest)
         value=dict(result,path=relative.as_posix(),kind=kind,cached=False,harvest_ts=now())
         if recovered_corrupt_path: value['recovered_corrupt_path']=recovered_corrupt_path
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?)',(url,json.dumps(value,ensure_ascii=False)))
         return value
 
-    def process(self, row, client, retry=False):
+    def process(self, row, client, retry=False, candidate_limit=None,event_callback=None):
         rid=row['record_id']
         trace=[]
         files={}
         extracted=[]
+        global_candidate_shas={f['sha256'] for saved in self.db.execute('SELECT payload FROM results')
+                               for f in json.loads(saved[0]).get('files',[])
+                               if not obvious_site_document(f.get('url',''))}
         prior=self.db.execute('SELECT payload FROM results WHERE id=?',(rid,)).fetchone()
         if prior:
             previous=json.loads(prior[0])
@@ -170,12 +188,15 @@ class Downloader:
         queue=[(url,0) for url in dict.fromkeys(row.get('urls',[])) if not already_obtained(url)]
         limited=False
         while queue and len(visited)<12:
+            reached_target=False
             url,depth=queue.pop(0)
             if url in visited: continue
             visited.add(url)
             event=dict(url=url,at=now(),depth=depth,pipeline_version=VERSION,
                        input_sha256=self.input_sha)
             if getattr(client,'run_id',None): event['run_id']=client.run_id
+            if event_callback:
+                event_callback('start',dict(record_id=rid,url=url,depth=depth))
             try:
                 result=self.obtain(client,url,refresh=retry)
                 event.update(final_url=result['url'],kind=result['kind'],sha256=result['sha256'],
@@ -184,6 +205,11 @@ class Downloader:
                     duplicate=result['sha256'] in files
                     files.setdefault(result['sha256'],dict(result,validation='assinatura_e_EOF',document_role='nao_verificado'))
                     event['status']='pdf_duplicado' if duplicate else 'pdf_obtido'
+                    if not obvious_site_document(result.get('url','')):
+                        was_known=result['sha256'] in global_candidate_shas
+                        global_candidate_shas.add(result['sha256'])
+                        reached_target=(not was_known and candidate_limit is not None and
+                                        len(global_candidate_shas)>=candidate_limit)
                 elif result['kind']=='html':
                     raw=(self.directory/result['path']).read_bytes()
                     if len(raw)>10*1024**2: raise FetchError('html_grande','Página HTML excede 10 MiB para parsing.')
@@ -217,8 +243,14 @@ class Downloader:
             with self.db:
                 self.db.execute('INSERT INTO attempts(record_id,payload) VALUES(?,?)',
                                 (rid,json.dumps(event,ensure_ascii=False)))
+            if event_callback:
+                event_callback('end',dict(event,record_id=rid))
             if event['status']=='limite_execucao':
                 limited=True
+                break
+            if reached_target:
+                event['collection_target_reached']=candidate_limit
+                limited=limited or bool(queue)
                 break
         limited=limited or bool(queue)
         status='sucesso' if files else 'sem_link_origem' if not row.get('urls') else 'nao_obtido'
@@ -236,11 +268,15 @@ class Downloader:
         metadata=[dict(record_id=r['record_id'],**m) for r in rows for m in r['metadata_from_html']]
         atomic(self.directory/'staging/metadata_html.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in metadata))
         reasons=collections.Counter(a['status'] for r in rows for a in r['attempts'])
+        failure_reasons=collections.Counter(a['status'] for r in rows for a in r['attempts']
+                                            if a['status'] not in COMPLETED_ATTEMPTS)
         unique={f['sha256']:f['bytes'] for r in rows for f in r['files']}
         site_documents={f['sha256']:f['bytes'] for r in rows for f in r['files']
                         if obvious_site_document(f.get('url',''))}
         candidate_work_files={f['sha256']:f['bytes'] for r in rows for f in r['files']
                               if not obvious_site_document(f.get('url',''))}
+        works_with_candidate_pdf=sum(any(not obvious_site_document(f.get('url',''))
+                                         for f in r['files']) for r in rows)
         pdf_events=[a for r in rows for a in r['attempts']
                     if a['status'] in ('pdf_obtido','pdf_duplicado')]
         seen_pdf=set()
@@ -262,7 +298,9 @@ class Downloader:
                     input_records=total_input,processed_records=len(rows),
                     remaining_records=total_input-len(rows),statuses=dict(collections.Counter(r['status'] for r in rows)),
                     unique_pdfs=len(unique),pdf_bytes=sum(unique.values()),attempt_statuses=dict(reasons),
+                    failure_statuses=dict(failure_reasons),
                     candidate_work_pdfs=len(candidate_work_files),
+                    works_with_candidate_pdf=works_with_candidate_pdf,
                     site_document_pdfs=len(site_documents),
                     possible_extra_candidate_files=sum(max(0,sum(not obvious_site_document(f.get('url',''))
                                                                   for f in r['files'])-1) for r in rows),

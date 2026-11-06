@@ -66,6 +66,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(params['lookfor0[]'],['Linguagem','Linguagem','Comunicação','Comunicação'])
         self.assertEqual(params['type0[]'],['Subject','Abstract','Subject','Abstract'])
         self.assertEqual(params['page'],['3'])
+    def test_optional_facets_are_repeated(self):
+        config=dict(CONFIG,facets=['publishDate','institution'])
+        params=parse_qs(urlsplit(build_url(config,1)).query)
+        self.assertEqual(params['facet[]'],['publishDate','institution'])
     def test_normalization_keeps_original(self):
         row=validate(response([1,2]))['records'][0]
         out=normalize(row,{})

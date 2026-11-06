@@ -92,6 +92,17 @@ class PDFTests(unittest.TestCase):
     def test_input_validation_and_snapshot(self):
         with self.assertRaises(ValueError): load_rows(b'{"record_id":"a","urls":"bad"}')
         with self.assertRaises(ValueError): Downloader(self.tmp.name,b'different')
+    def test_incremental_input_only_accepts_immutable_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first=b'{"record_id":"a","title":"A","urls":[]}\n'
+            worker=Downloader(directory,first,allow_growing_input=True)
+            worker.db.close()
+            extended=first+b'{"record_id":"b","title":"B","urls":[]}\n'
+            worker=Downloader(directory,extended,allow_growing_input=True)
+            worker.db.close()
+            changed=b'{"record_id":"a","title":"alterado","urls":[]}\n'
+            with self.assertRaisesRegex(ValueError,'extensão imutável'):
+                Downloader(directory,changed,allow_growing_input=True)
     def test_multiple_attachments(self):
         page='https://example.org/item'
         client=Fake(self.tmp.name,{page:(b'<a href="/a.pdf">a</a><a href="/b.pdf">b</a>','text/html'),
@@ -99,6 +110,16 @@ class PDFTests(unittest.TestCase):
         r=self.worker.process(dict(record_id='a',urls=[page]),client)
         self.assertEqual(len(r['files']),2)
         self.assertFalse(r['all_attachments_confirmed'])
+
+    def test_collection_candidate_limit_stops_before_second_pdf(self):
+        page='https://example.org/item'
+        first='https://example.org/a.pdf'; second='https://example.org/b.pdf'
+        client=Fake(self.tmp.name,{page:(b'<a href="/a.pdf">a</a><a href="/b.pdf">b</a>','text/html'),
+            first:(PDF,'application/pdf'),second:(PDF.replace(b'fixture',b'appendix'),'application/pdf')})
+        result=self.worker.process(dict(record_id='a',urls=[page]),client,candidate_limit=1)
+        self.assertEqual(len(result['files']),1)
+        self.assertTrue(result['limited'])
+        self.assertEqual(client.calls,[page,first])
 
     def test_duplicate_pdf_response_is_explicit_in_report(self):
         page='https://example.org/item'; a='https://example.org/a.pdf'; alias='https://example.org/alias.pdf'

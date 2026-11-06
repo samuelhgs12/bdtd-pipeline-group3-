@@ -112,3 +112,65 @@ A taxa de 34% mede somente esta amostra da janela acessível e é afetada pela d
 ## Próximo passo
 
 Revisar `review_50.csv` e preencher `final_decision` para os 50 trabalhos. Depois da decisão humana, avaliar com o professor a adequação do recorte e investigar um particionamento oficial e não sobreposto da consulta que contorne a limitação estatística da janela sem contornar controles de acesso. A extração de texto permanece adiada.
+
+## Preparação da coleta de até 5.000 candidatos — 12/09/2026
+
+A revisão temática dos 50 registros permanece disponível, mas deixou de bloquear a etapa técnica. Foi criado o orquestrador `bdtd.collect`, que valida os filtros, descobre partições, arquiva respostas Raw, deduplica IDs entre partições, alimenta incrementalmente o downloader e fecha lotes verificados. A extração de texto continua fora do escopo.
+
+A descoberta real da API, executada em 12/09/2026, voltou a informar **115.070** resultados e retornou facetas `publishDate` e `institution`. Foram expostos 30 anos, de 1997 a 2026, que somam 112.601 ocorrências; as demais ocorrências são cobertas por duas partições complementares explícitas: campo de ano presente sem qualquer dos 30 valores expostos e ausência de ano (`-publishDate:[* TO *]`). Assim, valores antigos, futuros ou não normalizados não são descartados silenciosamente. A faceta de instituições também foi limitada às 30 entradas mais frequentes. Seus próprios `href` confirmam os filtros `publishDate:"valor"` e `institution:"valor"`.
+
+Cada partição anual com mais de 1.000 resultados é subdividida pelas instituições expostas e por um complemento com filtros negativos. As contagens das partições filhas são obtidas em consultas reais, sem reaproveitar incorretamente a contagem global da faceta. Se uma subpartição continuar acima de 1.000, o coletor registra a limitação, coleta somente a janela acessível e confirma a repetição posterior. O banco mantém todas as associações `record_id`–partição, permitindo deduplicar o registro sem perder a proveniência.
+
+A API aplicou HTTP 429 às consultas seguintes à descoberta, inclusive com intervalo de dez segundos e tentativas espaçadas em 15, 30 e 60 segundos. Essas respostas estão em `data/coleta-5000/logs/api_http.jsonl`. O cliente foi corrigido para que 429 e 5xx não marquem uma partição como inacessível. No comando principal, um 429 sem `Retry-After` causa espera conservadora de 60 minutos, limitada a quatro esperas por execução; `Ctrl+C` continua preservando o estado. O comando conclui a validação pendente antes de iniciar downloads e prossegue automaticamente quando o servidor voltar a aceitar as consultas. O progresso parcial fica em `data/coleta-5000/reports/partition_validation_progress.json`, e o relatório concluído ficará em `partition_validation.json`.
+
+As 23 ocorrências anteriores de `robots_indisponivel` foram reagrupadas por causa: seis HTTP 503 da UNICAMP, quatro HTTP 403 da PUC-SP, duas falhas TLS da UFRGS, duas respostas HTML em vez de política da UECE, dois timeouts da PUC Minas e ocorrências isoladas de HTML, TLS, timeout, HTTP 503, 468 e 403 em outros domínios. Não foi comprovado erro do cliente que autorizasse acesso. Políticas indisponíveis continuam sem autorizar o recurso; login, embargo, desafios e erros TLS não são contornados.
+
+O downloader agora aceita apenas extensões imutáveis da fila anterior, preserva cada snapshot e interrompe antes de baixar outro candidato quando alcança 5.000 SHA-256 candidatos. Há reserva padrão de **10 GiB**, conferida antes e durante streaming e empacotamento. Na preparação havia 47,6 GiB livres. A execução mostra registros tentados, trabalhos com PDF, PDFs únicos candidatos, bytes e falhas por motivo.
+
+Os lotes são fechados em torno de 1 GiB, sem dividir PDF. Cada `batch-NNNN` contém `pdfs/`, `metadata/records.jsonl`, `results/download_results.jsonl`, `manifest.jsonl`, `checksums.sha256` e `CLOSED.json`. Caminhos são relativos, associações de vários registros ao mesmo SHA são preservadas e a integridade é verificada antes do fechamento. Os objetos originais não são apagados e não há integração ativa com Drive.
+
+Comando exato para iniciar e retomar:
+
+```powershell
+C:\Python314\python.exe -X utf8 -m bdtd.collect --contact (git config user.email) --config conf\api-validacao-linguagem-comunicacao.json --data-dir data\coleta-5000 --target-pdfs 5000 --reserve-gb 10 --batch-gb 1 --budget-gb 20 --max-hours 8 --rate-limit-wait-minutes 60 --max-rate-limit-waits 4
+```
+
+Comandos de preparação e verificação executados:
+
+```powershell
+C:\Python314\python.exe -X utf8 -m bdtd.api --contact $bdtdContact --data-dir data\coleta-5000\partition-validation\facets --config conf\api-partition-discovery.json --pages 1
+C:\Python314\python.exe -X utf8 -m bdtd.collect --contact $bdtdContact --config conf\api-validacao-linguagem-comunicacao.json --data-dir data\coleta-5000 --target-pdfs 5000 --reserve-gb 10 --batch-gb 1 --budget-gb 20 --max-hours 8 --validate-only
+C:\Python314\python.exe -X utf8 -m unittest discover -s tests -v
+```
+
+Os **79 testes** passaram no Windows com Python 3.14. Eles cobrem a consulta avançada, facetas, filtros complementares, paginação repetida, deduplicação, extensão imutável da fila, retomada e espera limitada após rate limit, limite estrito de candidatos, limites de disco e transferência, robots, múltiplos arquivos, SHA-256 e fechamento/verificação de lotes. A evidência real da descoberta está em `data/coleta-5000/partition-validation/facets/`; o estado retomável e os diagnósticos ficam em `data/coleta-5000/`.
+
+### Diagnóstico e visibilidade da execução em 12/09/2026
+
+Às 14:30 no horário local, não havia processo Python da coleta em execução. O último evento HTTP foi um 429 da API BDTD às 14:21:53, e `collection.json` registrou interrupção pelo usuário às 14:28:31. O estado tinha uma validação parcial e uma resposta API em cache, com zero partições, zero registros na fila e zero downloads. `PRAGMA quick_check` retornou `ok`. Nenhuma segunda coleta foi iniciada durante o diagnóstico.
+
+O relógio de `--max-hours` agora começa antes da validação e inclui todas as esperas por 429. A espera verifica o prazo em blocos de no máximo 30 segundos e termina com estado retomável ao alcançá-lo. Ao receber 429, o coletor tenta primeiro todos os registros já persistidos na fila; somente a API BDTD fica em pausa. Os downloads continuam sequenciais e respeitam `robots.txt`, atrasos e controles de cada domínio de destino.
+
+Foi acrescentado heartbeat de 30 segundos com etapa, fila ainda sem resultado, trabalhos tentados, trabalhos com PDF candidato, PDFs únicos candidatos, MiB de PDFs no Raw e falhas reais. Início e fim de etapas e de cada requisição de download usam `flush=True`. A mensagem de 429 inclui o motivo e a hora local prevista para a próxima consulta.
+
+### Auditoria do HTTP 429 e reaproveitamento local — 12/09/2026
+
+O 429 foi localizado no endpoint de **busca** `https://bdtd.ibict.br/vufind/api/v1/search`, não em `robots.txt`, facetas isoladas ou repositórios de PDFs. A sequência inicial registrada em UTC foi: `16:38:25` robots 200; `16:38:26` busca raiz com facetas 200 e 26.281 bytes; `16:38:28`, `16:38:31`, `16:38:35.438` e `16:38:35.628` a mesma busca filtrada por `publishDate:"2024"` respondeu 429. Às `16:39:30` robots voltou a responder 200, `16:39:35` a raiz respondeu 200 e, entre `16:39:42` e `16:39:55`, o filtro por 2024 recebeu mais quatro 429. Mais tarde, o filtro de menor contagem, `publishDate:"1997"`, também recebeu 429. O último evento anterior a esta auditoria ocorreu às `17:52:39 UTC` (`14:52:39 -03:00`), novamente no filtro por 1997.
+
+Os eventos antigos registraram status 429, URL, tentativa e erro `HTTP Error 429: Too Many Requests`, mas não consumiram o corpo nem guardaram cabeçalhos. Portanto, **não há evidência histórica de `Retry-After`, `Content-Type` ou mensagem do corpo**; os 60 minutos usados eram política do cliente, não exigência comprovada da BDTD. Os 429 tiveram zero bytes registrados pelo logger antigo. O único item em `api_cache` é a resposta JSON bem-sucedida da busca raiz, SHA-256 `9480910f344a70e5595d5e2db842927c3f9eba5da329c7293967e276f0da4db1`; nenhum 429 foi reutilizado como resposta válida de cache.
+
+Foi comprovado um excesso nas primeiras execuções: a camada de rede repetia cada 429 até quatro vezes e depois o controlador aplicava sua própria retomada. A configuração principal já passou a usar `retry_429=False`; a auditoria acrescentou teste que exige uma única chamada. Também foi eliminado o `ESPERA_INICIO` duplicado. A busca raiz bem-sucedida já era reaproveitada do cache, mas `robots.txt` era solicitado novamente em toda reinicialização; políticas válidas da BDTD agora têm cache persistente por 24 horas.
+
+Novos erros HTTP passam a registrar `source=network`, `Retry-After`, `Content-Type`, data, servidor e até 4 KiB de texto do corpo, com leitura limitada a 64 KiB. Cabeçalhos de cookie e autenticação não são registrados. Eventos reaproveitados são marcados `source=cache`. O SQLite ganhou histórico `api_rate_limits` e o prazo ativo em `api_cooldowns`. Reiniciar antes do prazo não antecipa uma consulta; o prazo mais recente do log legado também é migrado. `Retry-After` numérico ou em data tem precedência. Ausente ou inválido, aplica-se a política configurada por `--rate-limit-wait-minutes` e sua origem fica explícita.
+
+Foram identificados 95 metadados únicos compatíveis para importação: 40 da coleta de duas páginas da consulta atual, 50 da amostra da mesma consulta (um ID sobreposto) e seis IDs adicionais exclusivos do piloto anterior por `Subject`, subconjunto lógico do OR atual. A importação verifica tipos, filtros e parâmetros no URL de origem, deduplica por `record_id` e preserva cada payload/fonte em `record_sources`. Os dois pilotos de PDF contêm 23 PDFs candidatos únicos já obtidos, associados a 21 trabalhos, além de um documento institucional conhecido; todos serão conferidos por SHA-256 no reaproveitamento.
+
+Comando atualizado para importar, reaproveitar, executar downloads pendentes antes da API e retomar a coleta:
+
+```powershell
+C:\Python314\python.exe -X utf8 -m bdtd.collect --contact (git config user.email) --config conf\api-validacao-linguagem-comunicacao.json --data-dir data\coleta-5000 --target-pdfs 5000 --reserve-gb 10 --batch-gb 1 --budget-gb 20 --max-hours 8 --rate-limit-wait-minutes 60 --max-rate-limit-waits 4 --repository-retry-hours 24 --import-metadata data\validacao-linguagem-comunicacao\api\staging\api_metadados.jsonl --import-metadata data\validacao-linguagem-comunicacao\sample-accessible\selected_50.jsonl --import-metadata examples\piloto_40_metadados.jsonl --reuse-pdf-dir data\validacao-linguagem-comunicacao\pdf-sample-50 --reuse-pdf-dir data\pdf-piloto
+```
+
+Os **83 testes** passaram no Python 3.14, incluindo ausência de cache para 429, persistência do prazo entre retomadas, importação/deduplicação com proveniência, reaproveitamento por SHA-256 e captura segura da evidência HTTP.
+
+A preparação offline importou efetivamente os 95 IDs e 130 associações de fonte. Foram reaproveitados e conferidos 23 PDFs candidatos únicos de 21 trabalhos, mais um documento institucional conhecido. Duas rodadas controladas atingiram os repositórios sem consultar a BDTD. A primeira reavaliou nove URLs antigas e não obteve arquivo novo; a segunda processou dez registros inéditos e obteve quatro PDFs novos: dois da UFSC (405.411 e 428.595 bytes), um da PUCRS (1.987.957 bytes) e um da UEL (21.257.402 bytes). O estado passou a **76 trabalhos processados, 25 com PDF, 27 PDFs candidatos únicos e 19 registros inéditos restantes**. Falhas recentes não são repetidas antes de 24 horas por padrão. O prazo da API continuou intacto em `2026-09-12T18:52:39.687018+00:00` (`15:52:39 -03:00`), por isso nenhum diagnóstico antecipado foi enviado.
