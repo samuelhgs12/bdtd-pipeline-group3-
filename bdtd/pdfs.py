@@ -1,5 +1,4 @@
-"""Piloto de PDFs. Download não equivale a validação semântica ou extração."""
-import argparse
+"""Download de PDFs candidatos. Download não equivale a validação semântica ou extração."""
 import collections
 import hashlib
 import json
@@ -11,7 +10,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 from .core import atomic, digest, now
-from .pdf_http import FetchError, StreamClient, clean_url
+from .pdf_http import FetchError, clean_url
 
 VERSION='0.4.0'
 LIMIT_STATUSES={'limite_arquivo','limite_execucao','limite_profundidade',
@@ -95,6 +94,7 @@ class Downloader:
         self.directory=Path(directory)
         self.directory.mkdir(parents=True,exist_ok=True)
         self.input_sha=digest(input_bytes)
+        self.candidate_shas=None
         self.db=sqlite3.connect(self.directory/'pdf_state.sqlite')
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, sha TEXT);
@@ -121,6 +121,8 @@ class Downloader:
                 self.db.close()
                 raise ValueError('A nova entrada não é uma extensão imutável da anterior.')
             with self.db: self.db.execute('UPDATE settings SET sha=? WHERE id=1',(self.input_sha,))
+            # A nova entrada contém a anterior inteira; manter as duas só duplica disco.
+            previous_path.unlink()
         else:
             with self.db: self.db.execute('INSERT OR IGNORE INTO settings VALUES(1,?)',(self.input_sha,))
 
@@ -170,9 +172,12 @@ class Downloader:
         trace=[]
         files={}
         extracted=[]
-        global_candidate_shas={f['sha256'] for saved in self.db.execute('SELECT payload FROM results')
-                               for f in json.loads(saved[0]).get('files',[])
-                               if not obvious_site_document(f.get('url',''))}
+        if self.candidate_shas is None:
+            # Lido uma vez por Downloader, depois mantido em memória.
+            self.candidate_shas={f['sha256'] for saved in self.db.execute('SELECT payload FROM results')
+                                 for f in json.loads(saved[0]).get('files',[])
+                                 if not obvious_site_document(f.get('url',''))}
+        global_candidate_shas=self.candidate_shas
         prior=self.db.execute('SELECT payload FROM results WHERE id=?',(rid,)).fetchone()
         if prior:
             previous=json.loads(prior[0])
@@ -239,6 +244,7 @@ class Downloader:
                 event.update(status=getattr(exc,'code','erro_rede_ou_processamento'),reason=str(exc))
                 if getattr(exc,'details',None): event['details']=dict(exc.details)
             limited=limited or event['status'] in LIMIT_STATUSES
+            if reached_target: event['collection_target_reached']=candidate_limit
             trace.append(event)
             with self.db:
                 self.db.execute('INSERT INTO attempts(record_id,payload) VALUES(?,?)',
@@ -248,10 +254,7 @@ class Downloader:
             if event['status']=='limite_execucao':
                 limited=True
                 break
-            if reached_target:
-                event['collection_target_reached']=candidate_limit
-                limited=limited or bool(queue)
-                break
+            if reached_target: break
         limited=limited or bool(queue)
         status='sucesso' if files else 'sem_link_origem' if not row.get('urls') else 'nao_obtido'
         result=dict(record_id=rid,title=row.get('title'),status=status,files=list(files.values()),
@@ -335,55 +338,3 @@ def load_rows(data):
         if not isinstance(row.get('urls'),list) or not all(isinstance(u,str) for u in row['urls']):
             raise ValueError('urls deve ser lista de strings.')
     return rows
-
-def main():
-    parser=argparse.ArgumentParser(description='Piloto de download de PDFs BDTD')
-    parser.add_argument('--input',type=Path,default=Path('examples/piloto_40_metadados.jsonl'))
-    parser.add_argument('--data-dir',type=Path,default=Path('data/pdf-piloto'))
-    parser.add_argument('--contact',required=True)
-    parser.add_argument('--limit',type=int,default=8,help='Máximo de registros tentados nesta execução')
-    parser.add_argument('--max-mb',type=int,default=100)
-    parser.add_argument('--budget-mb',type=int,default=500)
-    parser.add_argument('--retry-failed',action='store_true',help='Inclui falhas e sucessos parciais; páginas HTML são atualizadas')
-    args=parser.parse_args()
-    if not 1<=args.limit<=50 or args.max_mb<1 or args.budget_mb<1: parser.error('Limite: 1–50 registros; MB devem ser positivos.')
-    if '@' not in args.contact or any(c.isspace() for c in args.contact): parser.error('Informe um e-mail válido.')
-    worker=None
-    try:
-        data=args.input.read_bytes()
-        rows=load_rows(data)
-        worker=Downloader(args.data_dir,data)
-        client=StreamClient(args.contact,args.data_dir,args.max_mb*1024**2,args.budget_mb*1024**2)
-        attempted=0
-        for row in rows:
-            prior=worker.db.execute('SELECT payload FROM results WHERE id=?',(row['record_id'],)).fetchone()
-            if prior:
-                old=json.loads(prior[0])
-                if old['status']=='sucesso':
-                    valid_files=all((args.data_dir/f['path']).exists() and file_hash(args.data_dir/f['path'])==f['sha256'] for f in old['files'])
-                    incomplete=old['limited'] or any(a['status'] not in COMPLETED_ATTEMPTS for a in old['attempts'])
-                    if valid_files and not (args.retry_failed and incomplete): continue
-                elif not args.retry_failed: continue
-            if attempted>=args.limit or client.transferred>=client.budget: break
-            print('Processando:',row['record_id'],flush=True)
-            client.record_id=row['record_id']
-            try:
-                result=worker.process(row,client,retry=args.retry_failed)
-            finally:
-                client.record_id=None
-            attempted+=1
-            worker.export(len(rows))
-            print(result['status'], '-',len(result['files']),'PDF(s)',flush=True)
-            if client.transferred>=client.budget or any(a['status']=='limite_execucao' for a in result['attempts']): break
-        report=worker.export(len(rows))
-        print('PDFs únicos:',report['unique_pdfs'])
-        print('Relatório:',(args.data_dir/'reports/pdf_pilot.json').resolve())
-    except KeyboardInterrupt:
-        if worker: worker.export(len(rows))
-        parser.exit(130,'Interrompido. Resultados concluídos preservados; execute novamente para retomar.\n')
-    except Exception as exc:
-        parser.exit(1,f'Interrompido: {exc}\n')
-    finally:
-        if worker: worker.db.close()
-
-if __name__=='__main__': main()

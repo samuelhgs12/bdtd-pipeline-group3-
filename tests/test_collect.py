@@ -13,8 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs,urlsplit,urlencode
 from unittest.mock import patch
 
-from bdtd.collect import (ANNUAL_WINDOW_PREFIX,Collector,TerminalProgress,quoted_filter,
-                          year_criterion)
+from bdtd.collect import Collector,TerminalProgress,quoted_filter,year_criterion
 from bdtd.api import build_url
 from bdtd.core import digest
 from bdtd.pdfs import Downloader
@@ -128,55 +127,6 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(report['candidate_work_pdfs'],1)
             collector.db.close()
 
-    def test_invalid_records_structure_stays_pending_then_resumes(self):
-        class Responses:
-            def __init__(self): self.calls=0
-            def get(self,url):
-                self.calls+=1
-                if self.calls==1: return b'{"resultCount":845,"status":"OK"}'
-                return json.dumps(dict(status='OK',resultCount=40,records=[
-                    dict(id=f'id-{i}',title='T',formats=['masterThesis'],subjects=[],urls=[])
-                    for i in range(20)])).encode()
-        with tempfile.TemporaryDirectory() as directory:
-            collector=Collector(directory,CONFIG,target=5,reserve_bytes=0,batch_bytes=10)
-            collector.plan_annual_windows(); client=Responses()
-            with self.assertRaisesRegex(ValueError,'resultCount/records inválidos'):
-                collector.harvest_annual_window(client)
-            part=collector.db.execute('SELECT id,status,next_page FROM partitions WHERE label=?',
-                                      (ANNUAL_WINDOW_PREFIX+'2024',)).fetchone()
-            self.assertEqual(part[1:],('planned',1))
-            self.assertIsNone(collector.db.execute('SELECT 1 FROM pages WHERE partition_id=?',(part[0],)).fetchone())
-            invalid=collector.db.execute('''SELECT category,status_value,result_count_type,
-              result_count_value,records_present,records_type FROM api_invalid_responses''').fetchone()
-            self.assertEqual(invalid,('estrutura_inesperada','"OK"','int','845',0,'NoneType'))
-            self.assertTrue(collector.harvest_annual_window(client))
-            self.assertEqual(collector.db.execute('SELECT status,next_page FROM partitions WHERE id=?',
-                                                  (part[0],)).fetchone(),('harvesting',2))
-            collector.db.close()
-
-    def test_rejected_positions_complete_real_845_total_without_page_44_request(self):
-        with tempfile.TemporaryDirectory() as directory:
-            collector=Collector(directory,CONFIG,target=5,reserve_bytes=0,batch_bytes=10)
-            collector.plan_annual_windows()
-            part=collector.db.execute('SELECT id FROM partitions WHERE label=?',
-                                      (ANNUAL_WINDOW_PREFIX+'2024',)).fetchone()[0]
-            with collector.db:
-                collector.db.execute("UPDATE partitions SET status='harvesting',total=845,next_page=44 WHERE id=?",
-                                     (part,))
-                for page in range(1,44):
-                    count=20 if page<43 else 0
-                    collector.db.execute('INSERT INTO pages VALUES(?,?,?,?,?,?,?,?)',
-                        (part,page,845,count,f'sha-{page}',f'fp-{page}',f'https://x?page={page}','now'))
-                for position in range(5):
-                    collector.db.execute('INSERT INTO metadata_rejections VALUES(?,?,?,?,?,?,?,?)',
-                        (part,position+1,position,f'r{position}','reason','{}','sha','now'))
-            class NoNetwork:
-                def get(self,url): raise AssertionError('página 44 não deve ser consultada')
-            self.assertTrue(collector.harvest_annual_window(NoNetwork()))
-            self.assertEqual(collector.db.execute('SELECT status,error FROM partitions WHERE id=?',
-                                                  (part,)).fetchone(),('complete',None))
-            collector.db.close()
-
     def test_mixed_metadata_page_is_committed_individually_and_resume_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             collector=Collector(directory,CONFIG,target=5,reserve_bytes=0,batch_bytes=10)
@@ -214,51 +164,7 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(len(rejects),1)
             collector.db.close()
 
-    def test_annual_windows_import_archived_page_and_stop_partial_at_fifty(self):
-        class AnnualFake:
-            def __init__(self): self.urls=[]
-            def get(self,url):
-                self.urls.append(url); query=parse_qs(urlsplit(url).query)
-                page=int(query['page'][0]); start=(page-1)*20
-                records=[dict(id=f'annual-{i}',title=f'T {i}',formats=['masterThesis'],
-                              subjects=[],urls=[]) for i in range(start,start+20)]
-                return json.dumps(dict(status='OK',resultCount=1001,records=records)).encode()
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory); collector=Collector(root,CONFIG,target=5000,reserve_bytes=0,batch_bytes=10)
-            collector.plan_annual_windows()
-            config=dict(CONFIG,filters=CONFIG['filters'],facets=[],date_ranges=['publishDate'],
-                        publishDatefrom='2024',publishDateto='2024',limit=20)
-            url=build_url(config,1,limit=20)
-            body=json.dumps(dict(status='OK',resultCount=1001,records=[
-                dict(id=f'annual-{i}',title=f'T {i}',formats=['masterThesis'],subjects=[],urls=[])
-                for i in range(20)])).encode()
-            raw=root/'raw/diagnostic'/f'{digest(body)}.response'; raw.parent.mkdir(parents=True)
-            raw.write_bytes(body); reports=root/'reports'; reports.mkdir()
-            (reports/'api_diagnostic_2024_page_1.json').write_text(json.dumps(dict(
-                status=200,request_url=url,response=dict(path=raw.relative_to(root).as_posix(),
-                sha256=digest(body)))),encoding='utf-8')
-            callbacks=[]
-            self.assertEqual(collector.import_archived_annual_pages(lambda:callbacks.append(True)),1)
-            self.assertEqual(len(callbacks),1)
-            fake=AnnualFake()
-            for _ in range(49): self.assertTrue(collector.harvest_annual_window(fake))
-            row=collector.db.execute('SELECT status,total,next_page,error FROM partitions WHERE label=?',
-                                     (ANNUAL_WINDOW_PREFIX+'2024',)).fetchone()
-            self.assertEqual(row,('partial',1001,51,'limite_de_1000_posicoes'))
-            self.assertEqual(len(fake.urls),49)
-            params=parse_qs(urlsplit(fake.urls[-1]).query)
-            self.assertEqual(params['page'],['50']); self.assertEqual(params['limit'],['20'])
-            self.assertEqual(params['daterange[]'],['publishDate'])
-            self.assertEqual(params['publishDatefrom'],['2024'])
-            self.assertEqual(params['publishDateto'],['2024'])
-            self.assertNotIn('facet[]',params)
-            self.assertFalse(any(value.startswith('institution:') for value in params['filter[]']))
-            annual=json.loads((reports/'annual_windows.json').read_text(encoding='utf-8'))
-            self.assertEqual(annual['years'][0]['pages_obtained'],50)
-            self.assertTrue(annual['years'][0]['partial_coverage'])
-            collector.db.close()
-
-    def test_annual_request_uses_date_range_and_preserves_query(self):
+    def test_year_request_uses_date_range_and_preserves_query(self):
         config={'endpoint':'https://example.org/api','join':'AND','groups':[{'operator':'OR','clauses':[
             {'lookfor':'Linguagem','type':'Subject'},{'lookfor':'Linguagem','type':'Abstract'},
             {'lookfor':'Comunicação','type':'Subject'},{'lookfor':'Comunicação','type':'Abstract'}]}],
@@ -355,21 +261,6 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(resumed.active_cooldown(CONFIG['endpoint'])['blocked_until'],
                              first['blocked_until'])
             resumed.db.close()
-
-    def test_later_diagnostic_network_success_reconciles_cooldown_without_erasing_history(self):
-        with tempfile.TemporaryDirectory() as directory:
-            collector=Collector(directory,CONFIG,target=5,reserve_bytes=0,batch_bytes=10)
-            observed=datetime(2999,1,1,tzinfo=timezone.utc)
-            collector.record_rate_limit(CONFIG['endpoint'],None,observed+timedelta(hours=1),
-                                        'client_policy_no_retry_after',{},observed.isoformat())
-            logs=Path(directory)/'logs'; logs.mkdir(parents=True)
-            (logs/'api_diagnostic_http.jsonl').write_text(json.dumps(dict(
-                ts=(observed+timedelta(minutes=8)).isoformat(),url=CONFIG['endpoint']+'?page=2',
-                status=200,source='network'))+'\n',encoding='utf-8')
-            collector.bootstrap_cooldown_from_log(3600)
-            self.assertIsNone(collector.active_cooldown(CONFIG['endpoint']))
-            self.assertEqual(collector.db.execute('SELECT COUNT(*) FROM api_rate_limits').fetchone()[0],1)
-            collector.db.close()
 
     def test_cache_success_does_not_clear_cooldown(self):
         with tempfile.TemporaryDirectory() as directory:

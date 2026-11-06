@@ -8,7 +8,7 @@ import urllib.request
 import urllib.robotparser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from .core import atomic, digest, now, parse_oai
+from .core import atomic, digest, now
 
 ERROR_BODY_LIMIT = 64 * 1024
 
@@ -145,56 +145,3 @@ class Client:
             raise PermissionError('robots.txt impede acesso: ' + url)
         self.interval = max(self.interval, parser.crawl_delay(self.agent) or 0)
         return self.request(url)
-
-def query(endpoint, params):
-    return endpoint + ('&' if '?' in endpoint else '?') + urllib.parse.urlencode(params)
-
-def harvest(store, client, endpoint, set_spec, max_pages):
-    # Uma coleta é identificada pelo endpoint e pelo set confirmado.
-    job = digest((endpoint + '\n' + set_spec).encode())
-    previous = store.db.execute('SELECT token,done FROM jobs WHERE id=?', (job,)).fetchone()
-    token, done = previous or ('', 0)
-    if done:
-        return 0
-    pages = 0
-    for _ in range(max_pages):
-        params = {'verb': 'ListRecords', 'resumptionToken': token} if token else {
-            'verb': 'ListRecords', 'metadataPrefix': 'oai_dc', 'set': set_spec}
-        url = query(endpoint, params)
-        data = client.get(url)
-        root = parse_oai(data, 'ListRecords')
-        next_token = root.findtext('.//{http://www.openarchives.org/OAI/2.0/}resumptionToken', '').strip()
-        if token and next_token == token:
-            raise ValueError('Token repetido: paginação não avançou.')
-        store.archive(data, url)
-        with store.db:
-            store.db.execute('INSERT OR REPLACE INTO jobs VALUES(?,?,?)', (job, next_token, int(not next_token)))
-        pages += 1
-        token = next_token
-        if not token:
-            break
-    store.export()
-    return pages
-
-def spike(client, config, directory):
-    results = []
-    for item in config['candidates']:
-        result = {'url': item['url'], 'kind': item['kind'], 'checked_at': now()}
-        try:
-            data = client.get(item['url'])
-            if item['kind'] == 'oai':
-                parse_oai(data, item['verb'])
-            elif item['kind'] == 'api':
-                parsed = json.loads(data)
-                if not isinstance(parsed, dict):
-                    raise ValueError('API não retornou objeto JSON.')
-            else:
-                if b'verificando' in data.lower() or b'challenge' in data.lower():
-                    raise ValueError('Página de verificação; conteúdo não confirmado.')
-            result.update(status='resposta_valida', bytes=len(data))
-            atomic(directory / 'diagnostics' / (digest(item['url'].encode()) + '.txt'), data.decode('utf-8', errors='replace'))
-        except Exception as exc:
-            result.update(status='nao_confirmado', reason=str(exc))
-        results.append(result)
-    atomic(directory / 'reports' / 'spike.json', json.dumps(results, ensure_ascii=False, indent=2))
-    return results

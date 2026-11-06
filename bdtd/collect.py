@@ -14,7 +14,7 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .api import build_url, normalize, strings, validate
+from .api import build_url, normalize, validate
 from .batches import BatchBuilder
 from .core import atomic, digest, now
 from .network import Client
@@ -27,9 +27,6 @@ WINDOW=1000
 PAGE_LIMIT=100
 PARTITION_STRATEGY='year-and-global-institution-complements-v2'
 YEAR_CRITERION_PREFIX='__publishDate_year__:'
-ANNUAL_WINDOW_PREFIX='janela-anual-'
-ANNUAL_PAGE_LIMIT=20
-ANNUAL_MAX_PAGES=50
 
 
 class RateLimitStop(Exception):
@@ -347,7 +344,7 @@ class Collector:
                                     ensure_ascii=False)+'\n')
 
     def import_compatibility(self,row):
-        """Confirma pelo URL de origem que o registro veio da consulta atual ou de seu subconjunto."""
+        """Confirma pelo URL de origem que o registro veio da consulta atual."""
         if not set(row.get('formats',[])) & {'masterThesis','doctoralThesis'}:
             return None
         try:
@@ -362,9 +359,6 @@ class Collector:
                   for term,kind in zip(values,params.get(key.replace('lookfor','type'),[]))}
         if expected and expected <= observed:
             return 'consulta_atual_com_quatro_campos'
-        lookfor=' '.join(params.get('lookfor',[])).casefold()
-        if params.get('type')==['Subject'] and 'linguagem' in lookfor and 'comunicação' in lookfor:
-            return 'subconjunto_logico_da_consulta_atual_por_assunto'
         return None
 
     def import_metadata(self,paths):
@@ -485,8 +479,7 @@ class Collector:
         origin='{0.scheme}://{0.netloc}'.format(urllib.parse.urlsplit(self.config['endpoint']))
         endpoint_path=urllib.parse.urlsplit(self.config['endpoint']).path
         events=[]
-        for path in (self.directory/'logs/api_http.jsonl',
-                     self.directory/'logs/api_diagnostic_http.jsonl'):
+        for path in (self.directory/'logs/api_http.jsonl',):
             if not path.exists(): continue
             for line in path.read_text(encoding='utf-8-sig').splitlines():
                 try: event=json.loads(line); observed=datetime.fromisoformat(event['ts'])
@@ -673,149 +666,6 @@ class Collector:
                                'sem ano por filtro negativo']),
             ensure_ascii=False,indent=2))
 
-    def archived_years(self):
-        found={str(value) for value, in self.db.execute(
-            "SELECT value FROM facet_values WHERE field='publishDate'")}
-        for payload, in self.db.execute('SELECT payload FROM api_cache'):
-            try: items=json.loads(bytes(payload)).get('facets',{}).get('publishDate',[])
-            except (ValueError,TypeError,AttributeError): continue
-            found.update(str(item['value']) for item in items
-                         if isinstance(item,dict) and item.get('value') is not None)
-        found.add('2024')
-        return ['2024']+sorted((value for value in found if value!='2024'),reverse=True)
-
-    def plan_annual_windows(self):
-        for priority,year in enumerate(self.archived_years()):
-            label=ANNUAL_WINDOW_PREFIX+year
-            part_id=digest(('annual-window-v1\n'+year).encode())[:24]
-            with self.db:
-                self.db.execute('''INSERT OR IGNORE INTO partitions
-                  VALUES(?,?,?,?,?,'planned',NULL,1,NULL,0,NULL,?,?)''',
-                  (part_id,label,json.dumps([year_criterion(year)]),None,priority,now(),now()))
-
-    def import_archived_annual_pages(self,after_page=None):
-        """Importa somente diagnósticos cuja URL coincide exatamente com a consulta anual."""
-        reports=list((self.directory/'reports').glob('api_diagnostic_2024_page_*.json'))
-        legacy=self.directory/'reports/api_diagnostic_2024.json'
-        if legacy.exists(): reports.append(legacy)
-        part=self.db.execute('SELECT id FROM partitions WHERE label=?',
-                             (ANNUAL_WINDOW_PREFIX+'2024',)).fetchone()
-        if not part: return 0
-        imported=0
-        for report_path in sorted(set(reports),key=lambda path:path.name):
-            try:
-                report=json.loads(report_path.read_text(encoding='utf-8'))
-                page=int(report.get('page') or urllib.parse.parse_qs(
-                    urllib.parse.urlsplit(report['request_url']).query)['page'][0])
-                expected_config=dict(self.config,filters=self.config['filters'],facets=[],
-                                     date_ranges=['publishDate'],publishDatefrom='2024',
-                                     publishDateto='2024',limit=ANNUAL_PAGE_LIMIT)
-                expected_url=build_url(expected_config,page,limit=ANNUAL_PAGE_LIMIT)
-                if report.get('status')!=200 or report.get('request_url')!=expected_url: continue
-                response=(self.directory/report['response']['path']).resolve()
-                if self.directory.resolve() not in response.parents: continue
-                data=response.read_bytes()
-                if digest(data)!=report['response']['sha256']: continue
-                obj=validate(data,allow_record_rejections=True); sha=self.archive(data)
-            except (OSError,ValueError,KeyError,TypeError):
-                continue
-            if self.db.execute('SELECT 1 FROM pages WHERE partition_id=? AND page=?',(part[0],page)).fetchone():
-                continue
-            self.store_records(part[0],page,obj,sha,expected_url)
-            obtained_pages={value[0] for value in self.db.execute(
-                'SELECT page FROM pages WHERE partition_id=?',(part[0],))}
-            next_page=next((candidate for candidate in range(1,ANNUAL_MAX_PAGES+1)
-                            if candidate not in obtained_pages),ANNUAL_MAX_PAGES+1)
-            unique_ids=self.db.execute('SELECT COUNT(*) FROM record_partitions WHERE partition_id=?',
-                                       (part[0],)).fetchone()[0]
-            if unique_ids>=obj['resultCount']:
-                status,reason,inaccessible='complete',None,0
-            elif next_page>ANNUAL_MAX_PAGES:
-                status,reason,inaccessible='partial','limite_de_1000_posicoes',max(0,obj['resultCount']-unique_ids)
-            else:
-                status,reason,inaccessible='harvesting',None,0
-            with self.db:
-                self.db.execute('''UPDATE partitions SET status=?,total=?,next_page=?,
-                  inaccessible_records=?,error=?,updated_at=? WHERE id=?''',
-                  (status,obj['resultCount'],next_page,inaccessible,reason,now(),part[0]))
-            imported+=1
-            self.export_metadata(); self.annual_windows_report()
-            if after_page: after_page()
-        return imported
-
-    def harvest_annual_window(self,client):
-        row=self.db.execute("""SELECT * FROM partitions
-          WHERE label LIKE ? AND status IN ('planned','harvesting') ORDER BY priority,id LIMIT 1""",
-          (ANNUAL_WINDOW_PREFIX+'%',)).fetchone()
-        if not row: return False
-        part_id,label=row[0],row[1]; page=1 if row[5]=='planned' else row[7]
-        filters=json.loads(row[2])
-        persisted=self.db.execute('SELECT COALESCE(SUM(count),0) FROM pages WHERE partition_id=?',
-                                  (part_id,)).fetchone()[0]
-        persisted+=self.db.execute('SELECT COUNT(*) FROM metadata_rejections WHERE partition_id=?',
-                                   (part_id,)).fetchone()[0]
-        if row[6] is not None and persisted>=row[6]:
-            with self.db:
-                self.db.execute("UPDATE partitions SET status='complete',inaccessible_records=0,error=NULL,updated_at=? WHERE id=?",
-                                (now(),part_id))
-            self.annual_windows_report(); return True
-        try:
-            obj,sha,url=self.request(client,filters,page=page,limit=ANNUAL_PAGE_LIMIT)
-            if row[6] is not None and obj['resultCount']!=row[6]:
-                raise ValueError('Total mudou durante a janela anual.')
-            if not obj['records'] and persisted<obj['resultCount']:
-                raise ValueError('Página válida vazia antes de persistir o total informado.')
-            self.store_records(part_id,page,obj,sha,url)
-            total=obj['resultCount']; pages=page
-            obtained=self.db.execute('SELECT COUNT(*) FROM record_partitions WHERE partition_id=?',
-                                     (part_id,)).fetchone()[0]
-            rejected=self.db.execute('SELECT COUNT(*) FROM metadata_rejections WHERE partition_id=?',
-                                     (part_id,)).fetchone()[0]
-            positions=self.db.execute('SELECT COALESCE(SUM(count),0) FROM pages WHERE partition_id=?',
-                                      (part_id,)).fetchone()[0]+rejected
-            if positions>=total:
-                status,reason,inaccessible='complete',None,0
-            elif pages>=ANNUAL_MAX_PAGES:
-                status,reason,inaccessible='partial','limite_de_1000_posicoes',max(0,total-obtained)
-            else:
-                status,reason,inaccessible='harvesting',None,0
-            with self.db:
-                self.db.execute('''UPDATE partitions SET status=?,total=?,next_page=?,
-                  inaccessible_records=?,error=?,updated_at=? WHERE id=?''',
-                  (status,total,page+1,inaccessible,reason,now(),part_id))
-        except ValueError as exc:
-            if not str(exc).startswith('Página repetida:'): raise
-            total=row[6] or 0
-            obtained=self.db.execute('SELECT COUNT(*) FROM record_partitions WHERE partition_id=?',
-                                     (part_id,)).fetchone()[0]
-            with self.db:
-                self.db.execute("""UPDATE partitions SET status='partial',inaccessible_records=?,
-                  error='pagina_repetida',updated_at=? WHERE id=?""",
-                  (max(0,total-obtained),now(),part_id))
-        self.export_metadata(); self.annual_windows_report()
-        return True
-
-    def annual_windows_report(self,stop_reason=None):
-        years=[]
-        for part_id,label,status,total,error in self.db.execute('''SELECT id,label,status,total,error
-          FROM partitions WHERE label LIKE ? ORDER BY priority,id''',(ANNUAL_WINDOW_PREFIX+'%',)):
-            pages=self.db.execute('SELECT COUNT(*) FROM pages WHERE partition_id=?',(part_id,)).fetchone()[0]
-            unique_ids=self.db.execute('SELECT COUNT(*) FROM record_partitions WHERE partition_id=?',
-                                       (part_id,)).fetchone()[0]
-            rejected=self.db.execute('SELECT COUNT(*) FROM metadata_rejections WHERE partition_id=?',
-                                     (part_id,)).fetchone()[0]
-            positions=self.db.execute('SELECT COALESCE(SUM(count),0) FROM pages WHERE partition_id=?',
-                                      (part_id,)).fetchone()[0]+rejected
-            years.append(dict(year=label[len(ANNUAL_WINDOW_PREFIX):],total_reported=total,
-                              pages_obtained=pages,unique_ids=unique_ids,rejected_records=rejected,
-                              positions_persisted=positions,status=status,
-                              interruption_reason=error,
-                              partial_coverage=(positions<total if total is not None else None)))
-        report=dict(version=VERSION,updated_at=now(),mode='annual_windows',page_limit=ANNUAL_PAGE_LIMIT,
-                    max_pages_per_year=ANNUAL_MAX_PAGES,stop_reason=stop_reason,years=years)
-        atomic(self.directory/'reports/annual_windows.json',json.dumps(report,ensure_ascii=False,indent=2))
-        return report
-
     def store_records(self,partition_id,page,obj,sha,url):
         existing=self.db.execute('SELECT sha,count,url FROM pages WHERE partition_id=? AND page=?',
                                  (partition_id,page)).fetchone()
@@ -995,9 +845,10 @@ class Collector:
                 retry=False
                 if prior:
                     old=json.loads(prior[0])
+                    # O tamanho basta aqui; o SHA-256 completo é conferido ao fechar o lote.
                     valid_files=all(item['sha256'] in archived_hashes or
                                     ((worker.directory/item['path']).exists() and
-                                    file_hash(worker.directory/item['path'])==item['sha256'])
+                                    (worker.directory/item['path']).stat().st_size==item['bytes'])
                                     for item in old.get('files',[]))
                     if old.get('status')=='sucesso' and valid_files and not old.get('limited'):
                         continue
@@ -1016,19 +867,12 @@ class Collector:
                 finally: pdf_client.record_id=None
                 self.download_attempted_ids.add(row['record_id'])
                 attempted+=1
-                report=worker.export(len(rows))
-                failures=collections.Counter(a['status'] for item in report['results']
-                    for a in item['attempts'] if a['status'] not in COMPLETED_ATTEMPTS)
-                if progress:
-                    progress.update_pdf(report,failures)
-                else:
-                    print('progresso:',f'tentados={report["processed_records"]}',
-                          f'trabalhos_pdf={report["works_with_candidate_pdf"]}',
-                          f'pdfs_unicos_candidatos={report["candidate_work_pdfs"]}',
-                          f'bytes={report["pdf_bytes"]}',f'falhas={dict(failures)}',flush=True)
-                if report['candidate_work_pdfs']>=self.target: break
+                if len(worker.candidate_shas)>=self.target: break
                 if any(a['status'] in ('limite_execucao','disco_reserva') for a in result['attempts']): break
-            return attempted,worker.export(len(rows))
+            # Exporta uma vez por ciclo: reescrever o manifesto inteiro a cada registro é O(n²).
+            report=worker.export(len(rows))
+            if progress: progress.update_pdf(report,report['failure_statuses'])
+            return attempted,report
         finally: worker.db.close()
 
     def report(self,pdf_report=None,stop_reason=None):
@@ -1104,8 +948,7 @@ class Collector:
 
     def run(self,contact,max_hours=8,budget_bytes=20*1024**3,max_records=None,
             rate_limit_wait_minutes=60,max_rate_limit_waits=4,
-            import_metadata_paths=(),reuse_pdf_dirs=(),repository_retry_hours=24,
-            annual_windows=False):
+            import_metadata_paths=(),reuse_pdf_dirs=(),repository_retry_hours=24):
         started=time.monotonic(); deadline=started+max_hours*3600
         rate_limit_waits=0; pdf_report=None; attempted_run=0; stop_reason=None
         self.download_attempted_ids=set()
@@ -1205,19 +1048,12 @@ class Collector:
             current=self.report(pdf_report)
             if current['downloads']['candidate_unique_pdfs']>=self.target:
                 stop_reason='meta_atingida'
-            if stop_reason is None and annual_windows:
-                progress.stage_start('planejamento_janelas_anuais')
-                try:
-                    self.plan_annual_windows()
-                    self.import_archived_annual_pages(
-                        after_page=lambda:drain_queue('downloads_pagina_arquivada'))
-                finally: progress.stage_end('planejamento_janelas_anuais')
-            if stop_reason is None and not annual_windows and not self.db.execute(
+            if stop_reason is None and not self.db.execute(
                     "SELECT 1 FROM validations WHERE name='partition_filters'").fetchone():
                 progress.stage_start('validacao_api')
                 try: guarded(lambda:self.validate_partitioning(api_client),'validacao')
                 finally: progress.stage_end('validacao_api')
-            if stop_reason is None and not annual_windows:
+            if stop_reason is None:
                 progress.stage_start('planejamento_particoes')
                 try: guarded(lambda:self.plan_root(api_client),'planejamento')
                 finally: progress.stage_end('planejamento_particoes')
@@ -1243,9 +1079,7 @@ class Collector:
                     stop_reason='meta_atingida'; break
                 try:
                     progress.stage_start('coleta_metadados')
-                    operation=(lambda:self.harvest_annual_window(api_client)) if annual_windows \
-                              else (lambda:self.harvest_one(api_client))
-                    harvested=guarded(operation,'coleta_metadados')
+                    harvested=guarded(lambda:self.harvest_one(api_client),'coleta_metadados')
                 except RateLimitStop as exc:
                     stop_reason=str(exc); break
                 finally:
@@ -1259,13 +1093,11 @@ class Collector:
                 builder.close_ready(self.directory/'pdfs/raw/manifest_pdf.jsonl',
                                     self.directory/'metadata/records.jsonl',force=True)
             final=self.report(pdf_report,stop_reason)
-            if annual_windows: self.annual_windows_report(stop_reason)
             progress.update_collection(final)
             return final
         except RateLimitStop as exc:
             stop_reason=str(exc)
             final=self.report(pdf_report,stop_reason)
-            if annual_windows: self.annual_windows_report(stop_reason)
             progress.update_collection(final)
             return final
         finally:
@@ -1276,7 +1108,8 @@ class Collector:
 def main():
     parser=argparse.ArgumentParser(description='Coleta particionada e retomável de até 5.000 PDFs candidatos')
     parser.add_argument('--contact',required=True)
-    parser.add_argument('--config',type=Path,default=Path('conf/api-validacao-linguagem-comunicacao.json'))
+    parser.add_argument('--config',type=Path,required=True,
+                        help='JSON da consulta (eixo temático); veja conf/exemplo-linguagem-comunicacao.json')
     parser.add_argument('--data-dir',type=Path,default=Path('data/coleta-5000'))
     parser.add_argument('--target-pdfs',type=int,default=5000)
     parser.add_argument('--reserve-gb',type=float,default=10.0)
@@ -1297,8 +1130,6 @@ def main():
                         help='Valida somente uma partição anual e encerra, sem coleta ou espera')
     parser.add_argument('--validate-institution',action='store_true',
                         help='No modo anual, acrescenta uma instituição escolhida das facetas arquivadas')
-    parser.add_argument('--annual-windows',action='store_true',
-                        help='Coleta janelas anuais de até 50 páginas, começando por 2024')
     args=parser.parse_args()
     if ('@' not in args.contact or '\\' in args.contact or
             any(char.isspace() for char in args.contact)):
@@ -1311,8 +1142,6 @@ def main():
         parser.error('Use somente um entre --validate-only e --validate-year.')
     if args.validate_institution and args.validate_year is None:
         parser.error('--validate-institution exige --validate-year.')
-    if args.annual_windows and (args.validate_only or args.validate_year is not None):
-        parser.error('--annual-windows não pode ser combinado com modos de validação.')
     collector=None
     try:
         config=json.loads(args.config.read_text(encoding='utf-8'))
@@ -1351,8 +1180,7 @@ def main():
         else:
             report=collector.run(args.contact,args.max_hours,int(args.budget_gb*1024**3),
                                  args.max_records,args.rate_limit_wait_minutes,args.max_rate_limit_waits,
-                                 args.import_metadata,args.reuse_pdf_dir,args.repository_retry_hours,
-                                 args.annual_windows)
+                                 args.import_metadata,args.reuse_pdf_dir,args.repository_retry_hours)
             print('Coleta encerrada de forma retomável:',report['stop_reason'])
             print('Relatório:',(args.data_dir/'reports/collection.json').resolve())
     except KeyboardInterrupt:
