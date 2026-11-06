@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import ssl
 import tempfile
 import time
@@ -37,10 +38,12 @@ def clean_url(url):
                        quote(p.query, safe='/%?:@!$&\'()*+,;=-._~'), ''))
 
 class StreamClient(Client):
-    def __init__(self, contact, directory, max_bytes=100*1024**2, budget=500*1024**2):
-        super().__init__(f'BDTD-Academic-Crawler/0.3.2 (contato: {contact})', log=Path(directory)/'logs/pdf_http.jsonl')
+    def __init__(self, contact, directory, max_bytes=100*1024**2, budget=500*1024**2,
+                 reserve_bytes=10*1024**3):
+        super().__init__(f'BDTD-Academic-Crawler/0.4.0 (contato: {contact})', log=Path(directory)/'logs/pdf_http.jsonl')
         self.directory = Path(directory)
         self.max_bytes, self.budget, self.transferred = max_bytes, budget, 0
+        self.reserve_bytes = reserve_bytes
         (self.directory/'tmp').mkdir(parents=True, exist_ok=True)
         self.robots_delays = {}
         self.policy_failures = {}
@@ -52,6 +55,11 @@ class StreamClient(Client):
         if self.transferred >= self.budget:
             raise failure('limite_execucao', 'Limite de transferência desta execução atingido.',
                           url, stage, 'execution_limit')
+        free=shutil.disk_usage(self.directory).free
+        if free<=self.reserve_bytes:
+            raise failure('disco_reserva','Reserva mínima de espaço em disco atingida.',
+                          url,stage,'disk_reserve',free_bytes=free,
+                          reserve_bytes=self.reserve_bytes)
 
     def _once(self, url, ceiling, stage='resource', attempt=1):
         self._check_budget(url, stage)
@@ -78,6 +86,11 @@ class StreamClient(Client):
                     raise FetchError('limite_arquivo', 'Content-Length excede o limite por resposta.')
                 if expected is not None and expected>self.budget-self.transferred:
                     raise FetchError('limite_execucao', 'Content-Length excede o saldo de transferência desta execução.')
+                free=shutil.disk_usage(self.directory).free
+                if expected is not None and free-expected<self.reserve_bytes:
+                    raise FetchError('disco_reserva','Content-Length consumiria a reserva mínima de disco.',
+                                     dict(free_bytes=free,reserve_bytes=self.reserve_bytes,
+                                          required_bytes=expected))
                 sha=hashlib.sha256()
                 while True:
                     # Com tamanho conhecido não é necessário ler além do corpo.

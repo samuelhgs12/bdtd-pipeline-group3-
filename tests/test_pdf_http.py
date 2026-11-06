@@ -60,6 +60,16 @@ class StreamHTTPTests(unittest.TestCase):
         self.assertFalse(self.client.rules)
         self.assertEqual([(r['stage'],r['attempt'],r['status']) for r in self.log()],[('robots',1,403)])
 
+    def test_disk_reserve_stops_before_network_request(self):
+        usage=type('Usage',(),{'free':99})()
+        self.client.reserve_bytes=100
+        with patch('bdtd.pdf_http.shutil.disk_usage',return_value=usage), \
+             patch.object(self.client.opener,'open') as opened:
+            failure=self.error()
+        self.assertEqual(failure.code,'disco_reserva')
+        self.assertEqual(failure.details['free_bytes'],99)
+        opened.assert_not_called()
+
     def test_robots_timeout_and_network_failures_keep_their_cause(self):
         for error, cause in ((TimeoutError('fixture timeout'),'timeout'),
                              (URLError(TimeoutError('fixture timeout')),'timeout'),
